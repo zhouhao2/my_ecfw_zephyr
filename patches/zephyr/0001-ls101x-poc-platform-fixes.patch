@@ -1,0 +1,3174 @@
+diff --git a/drivers/espi/CMakeLists.txt b/drivers/espi/CMakeLists.txt
+index bf37b87eef5..4b8ce44729d 100644
+--- a/drivers/espi/CMakeLists.txt
++++ b/drivers/espi/CMakeLists.txt
+@@ -16,6 +16,7 @@ zephyr_library_sources_ifdef(CONFIG_ESPI_XEC_V2		espi_mchp_xec_host_v2.c)
+ zephyr_library_sources_ifdef(CONFIG_ESPI_IT8XXX2	espi_it8xxx2.c)
+ zephyr_library_sources_ifdef(CONFIG_ESPI_TAF_XEC_V2	espi_saf_mchp_xec_v2.c)
+ zephyr_library_sources_ifdef(CONFIG_ESPI_LS     	espi_ls.c)
++zephyr_library_sources_ifdef(CONFIG_ESPI_LS_SIO     espi_ls_sio.c)
++zephyr_library_sources_ifdef(CONFIG_ESPI_LS_SIO_UART espi_ls_sio_uart.c)
+ zephyr_library_sources_ifdef(CONFIG_ESPI_LS_MMBI    espi_ls_mmbi.c)
+-zephyr_library_sources_ifdef(CONFIG_ESPI_LS_MMBI    espi_ls_sio.c)
+ zephyr_library_sources_ifdef(CONFIG_ESPI_BMC_LS     espi_bmc_ls.c)
+diff --git a/drivers/espi/Kconfig.ls b/drivers/espi/Kconfig.ls
+index 307a4635377..1fcc93b0cf4 100644
+--- a/drivers/espi/Kconfig.ls
++++ b/drivers/espi/Kconfig.ls
+@@ -14,6 +14,15 @@ config ESPI_LS_SIO
+     help
+         Enable Linkedsemi ESPI slave to sio driver.
+ 
++config ESPI_LS_SIO_UART
++    bool "Linkedsemi Super I/O UART (host COM via LDN)"
++    default y
++    depends on ESPI_LS_SIO && DT_HAS_LINKEDSEMI_LS_SIO_UART_ENABLED
++    help
++        Map host 16550 COM windows from SIO LDN onto DWUART (COM1/2) or
++        LSUART with a 16550 shim (COM3/4). Do not enable the SoC UART as a
++        Zephyr console.
++
+ config ESPI_LS_MMBI
+     bool "Linkedsemi ESPI slave to mmbi driver"
+     default y
+diff --git a/drivers/espi/espi_ls.c b/drivers/espi/espi_ls.c
+index 74eb8ec5b79..1577706c396 100644
+--- a/drivers/espi/espi_ls.c
++++ b/drivers/espi/espi_ls.c
+@@ -2,14 +2,31 @@
+ #include <zephyr/logging/log.h>
+ #include <zephyr/irq.h>
+ #include <zephyr/sys/util.h>
+-#include <zephyr/kernel.h>
++#include <zephyr/drivers/espi.h>
++#include <string.h>
+ #include <stdarg.h>
+ #include "reg_espi_type.h"
+ #include "espi_lpc_common.h"
++#include "espi_utils.h"
++#ifdef CONFIG_SOC_SERIES_LS101X
++#include "reg_sysc_cpu.h"
++#include "reg_sysc_awo.h"
++#include "field_manipulate.h"
++#endif
+ 
+ LOG_MODULE_REGISTER(espi, CONFIG_ESPI_LOG_LEVEL);
+ static const uint8_t espi_magic_num[] = ESPI_RECOVER_MAGIC;
+ 
++/*
++ * Intel platform VW (IT8xxx2/XEC/eSPI spec):
++ *   Host→EC SUS_WARN  @ idx 0x41 bit0 (Leo DN group P01)
++ *   EC→Host SUS_ACK   @ idx 0x40 bit0 + bit4 valid (upstream)
++ */
++#define ESPI_LS_VW_IDX_SUS_ACK		0x40
++#define ESPI_LS_VW_IDX_SUS_WARN		0x41
++#define ESPI_LS_VW_BIT_SUS		BIT(0)
++#define ESPI_LS_VW_BIT_SUS_VLD		BIT(4)
++
+ #ifdef CONFIG_SOC_SERIES_LS101X
+ static uint8_t pc_rx_buf[0x100];
+ static uint8_t np_rx_buf[0x100];
+@@ -17,27 +34,32 @@ static uint8_t pc_tx_buf[0x100];
+ static uint8_t vw_tx_buf[0x100];
+ static inline uint8_t *pc_rx_buf_get(const struct device *dev)
+ {
+-    return pc_rx_buf;
++	ARG_UNUSED(dev);
++	return pc_rx_buf;
+ }
+ 
+ static inline uint8_t *np_rx_buf_get(const struct device *dev)
+ {
+-    return np_rx_buf;
++	ARG_UNUSED(dev);
++	return np_rx_buf;
+ }
+ 
+ static inline uint8_t *pc_tx_buf_get(const struct device *dev)
+ {
+-    return pc_tx_buf;
++	ARG_UNUSED(dev);
++	return pc_tx_buf;
+ }
+ 
+ static inline uint8_t *vw_tx_buf_get(const struct device *dev)
+ {
+-    return vw_tx_buf;
++	ARG_UNUSED(dev);
++	return vw_tx_buf;
+ }
+ 
+-static inline uint32_t espi_buf_addr_to_reg(const struct device *dev,uint8_t *addr)
++static inline uint32_t espi_buf_addr_to_reg(const struct device *dev, uint8_t *addr)
+ {
+-    return (uint32_t)addr;
++	ARG_UNUSED(dev);
++	return (uint32_t)addr;
+ }
+ 
+ #else
+@@ -49,423 +71,872 @@ static inline uint32_t espi_buf_addr_to_reg(const struct device *dev,uint8_t *ad
+ 
+ static inline uint8_t *pc_rx_buf_get(const struct device *dev)
+ {
+-    const struct espi_lpc_ls_config *cfg = dev->config;
+-    return (uint8_t *)cfg->reg + ESPI_PC_RX_BUF_OFFSET;
++	const struct espi_lpc_ls_config *cfg = dev->config;
++	return (uint8_t *)cfg->reg + ESPI_PC_RX_BUF_OFFSET;
+ }
+ 
+ static inline uint8_t *np_rx_buf_get(const struct device *dev)
+ {
+-    const struct espi_lpc_ls_config *cfg = dev->config;
+-    return (uint8_t *)cfg->reg + ESPI_NP_RX_BUF_OFFSET;
++	const struct espi_lpc_ls_config *cfg = dev->config;
++	return (uint8_t *)cfg->reg + ESPI_NP_RX_BUF_OFFSET;
+ }
+ 
+ static inline uint8_t *pc_tx_buf_get(const struct device *dev)
+ {
+-    const struct espi_lpc_ls_config *cfg = dev->config;
+-    return (uint8_t *)cfg->reg + ESPI_PC_TX_BUF_OFFSET;
++	const struct espi_lpc_ls_config *cfg = dev->config;
++	return (uint8_t *)cfg->reg + ESPI_PC_TX_BUF_OFFSET;
+ }
+ 
+ static inline uint8_t *vw_tx_buf_get(const struct device *dev)
+ {
+-    const struct espi_lpc_ls_config *cfg = dev->config;
+-    return (uint8_t *)cfg->reg + ESPI_VW_TX_BUF_OFFSET;
++	const struct espi_lpc_ls_config *cfg = dev->config;
++	return (uint8_t *)cfg->reg + ESPI_VW_TX_BUF_OFFSET;
+ }
+ 
+-static inline uint32_t espi_buf_addr_to_reg(const struct device *dev,uint8_t *addr)
++static inline uint32_t espi_buf_addr_to_reg(const struct device *dev, uint8_t *addr)
+ {
+-    const struct espi_lpc_ls_config *cfg = dev->config;
+-    return (uint32_t)addr - (uint32_t)cfg->reg;
++	const struct espi_lpc_ls_config *cfg = dev->config;
++	return (uint32_t)addr - (uint32_t)cfg->reg;
+ }
+ #endif
+ 
+-static void espi_cs_callback(const struct device *port,struct gpio_callback *cb,gpio_port_pins_t pins)
++static void espi_ls_notify(const struct device *dev, enum espi_bus_event type,
++			   uint32_t details, uint32_t data)
++{
++	struct espi_lpc_ls_data *espi_data = dev->data;
++	struct espi_event evt = {
++		.evt_type = type,
++		.evt_details = details,
++		.evt_data = data,
++	};
++
++	espi_send_callbacks(&espi_data->callbacks, dev, evt);
++}
++
++/* POST 0x80: BIOS dumps progress codes; golden EC ACKs every write with CycType 0x06. */
++static void port80_io_read(const struct peri_ioport_content *ioport, uint8_t size, void *res)
++{
++	ARG_UNUSED(ioport);
++	ARG_UNUSED(size);
++	*(uint8_t *)res = 0;
++}
++
++static void port80_io_write(const struct peri_ioport_content *ioport, uint8_t size, uint8_t *data)
++{
++	ARG_UNUSED(ioport);
++	ARG_UNUSED(size);
++	ARG_UNUSED(data);
++}
++
++static struct peri_ioport_content ls_port80_content = {
++	.io_read = port80_io_read,
++	.io_write = port80_io_write,
++	.addr = 0x80,
++};
++
++static struct peri_ioport ls_port80_io = {
++	.content = &ls_port80_content,
++};
++
++static void espi_ls_notify_vw(const struct device *dev,
++			      enum espi_vwire_signal signal, uint8_t level)
+ {
+-    struct espi_data *espi = CONTAINER_OF(cb,struct espi_data,cs_cb);
+-    struct espi_lpc_ls_data *data = CONTAINER_OF(espi,struct espi_lpc_ls_data,u.espi);
+-    const struct espi_lpc_ls_config *cfg = data->cfg;
+-    reg_espi_t *reg = cfg->reg;
+-    reg->CFG_RECOVER_CTL = ESPI_CFG_ECLK_EN_MASK;
+-    gpio_pin_interrupt_configure_dt(&cfg->cs,GPIO_INT_DISABLE);
+-    gpio_remove_callback_dt(&cfg->cs,&data->u.espi.cs_cb);
++	espi_ls_notify(dev, ESPI_BUS_EVENT_VWIRE_RECEIVED, signal, level);
+ }
+ 
+-static void espi_vw_tx(const struct device *dev,uint8_t count,uint8_t idx,uint8_t val,...)
++static void espi_vw_tx(const struct device *dev, uint8_t count, uint8_t idx,
++		       uint8_t val, ...)
+ {
+ 	const struct espi_lpc_ls_config *cfg = dev->config;
+ 	struct espi_lpc_ls_data *data = dev->data;
+-    reg_espi_t *reg = cfg->reg;
++	reg_espi_t *reg = cfg->reg;
+ 	va_list vargs;
+-	uint32_t vw_first_word = val<<16|idx<<8|(count - 1);
++	uint32_t espi_stat;
++	uint32_t vw_first_word = val << 16 | idx << 8 | (count - 1);
+ 	uint8_t *vw_tx = vw_tx_buf_get(dev);
+-    k_sem_take(&data->u.espi.vw_tx_sem,K_FOREVER);
+-    reg->UP_VWIR_LEN_M1 = count*2;
++	k_spinlock_key_t flags = k_spin_lock(&data->u.espi.vw_tx_lock);
++
++	do {
++		espi_stat = reg->STATUS;
++	} while (espi_stat & ESPI_STATUS_SET_VWIRE_AVAIL_MASK);
++
++	reg->UP_VWIR_LEN_M1 = count * 2;
+ 	count--;
+-	va_start(vargs,val);
+-	if(count>0)
+-	{
+-		idx = va_arg(vargs,unsigned);
+-		val = va_arg(vargs,unsigned);
+-		vw_first_word |= idx<<24;
++	va_start(vargs, val);
++	if (count > 0) {
++		idx = va_arg(vargs, unsigned);
++		val = va_arg(vargs, unsigned);
++		vw_first_word |= idx << 24;
+ 		*vw_tx++ = val;
+ 		count--;
+ 	}
+-	while(count--)
+-	{
+-		idx = va_arg(vargs,unsigned);
+-		val = va_arg(vargs,unsigned);
++	while (count--) {
++		idx = va_arg(vargs, unsigned);
++		val = va_arg(vargs, unsigned);
+ 		*vw_tx++ = idx;
+ 		*vw_tx++ = val;
+ 	}
+ 	va_end(vargs);
+-    reg->UP_VWIR_DAT = vw_first_word;
+-    reg->STATUS_SET = ESPI_STATUS_ALERT_SET_MASK|ESPI_STATUS_SET_VWIRE_AVAIL_MASK;
++	reg->UP_VWIR_DAT = vw_first_word;
++	reg->STATUS_SET = ESPI_STATUS_ALERT_SET_MASK | ESPI_STATUS_SET_VWIRE_AVAIL_MASK;
++	k_spin_unlock(&data->u.espi.vw_tx_lock, flags);
+ }
+ 
+-static void mem_io_rd_rsp_pkt_build(uint8_t len,uint32_t data,uint8_t *up_data_buf,uint32_t *up_first_word,uint16_t *up_len)
++static void mem_io_rd_rsp_pkt_build(uint8_t len, uint32_t data, uint8_t *up_data_buf,
++				    uint32_t *up_first_word, uint16_t *up_len)
+ {
+-	*up_first_word = 0x0f| len<<16|(data & 0xff)<<24;
+-	*up_len = 3+len;
+-	up_data_buf[0] = data>>8;
+-	up_data_buf[1] = data>>16;
+-	up_data_buf[2] = data>>24;
++	*up_first_word = 0x0f | len << 16 | (data & 0xff) << 24;
++	*up_len = 3 + len;
++	up_data_buf[0] = data >> 8;
++	up_data_buf[1] = data >> 16;
++	up_data_buf[2] = data >> 24;
+ }
+ 
+-#define ESPI_SEND_OOB_RST_ACK_TYPE -3
+-#define ESPI_SEND_HOST_RST_ACK_TYPE -2
+-#define ESPI_SEND_BOOT_DONE_TYPE -1
+-
+-struct vw_tx_msg {
+-    const struct device *dev;
+-    int type;
+-};
+-
+-K_MSGQ_DEFINE(vw_tx_msgq,sizeof(struct vw_tx_msg),CONFIG_ESPI_VW_TX_MSG_MAX,4);
+-
+-static void vw_tx_msgq_put(const struct device *dev,int type)
++static void espi_send_oob_rst_ack(const struct device *dev)
+ {
+-    struct vw_tx_msg msg = {
+-        .dev = dev,
+-        .type = type,
+-    };
+-    int ret = k_msgq_put(&vw_tx_msgq,&msg,K_NO_WAIT);
+-    __ASSERT_NO_MSG(ret == 0);
++	espi_vw_tx(dev, 1, 4,
++		   ESPI_SYS_EVT_4_OOB_RST_ACK_VLD | ESPI_SYS_EVT_4_OOB_RST_ACK);
+ }
+ 
+-static void espi_send_oob_rst_ack(const struct device *dev)
++static void espi_send_host_rst_ack(const struct device *dev)
+ {
+-    vw_tx_msgq_put(dev,ESPI_SEND_OOB_RST_ACK_TYPE);
++	espi_vw_tx(dev, 1, 6,
++		   ESPI_SYS_EVT_6_HOST_RST_ACK_VLD | ESPI_SYS_EVT_6_HOST_RST_ACK);
+ }
+ 
+-static void espi_send_host_rst_ack(const struct device *dev)
++static void espi_send_sus_ack(const struct device *dev, uint8_t level)
+ {
+-    vw_tx_msgq_put(dev,ESPI_SEND_HOST_RST_ACK_TYPE);
++	/* idx 0x40: data bit0, valid bit4 (same packing as IT8xxx2). */
++	uint8_t wire = ESPI_LS_VW_BIT_SUS_VLD;
++
++	if (level) {
++		wire |= ESPI_LS_VW_BIT_SUS;
++	}
++	espi_vw_tx(dev, 1, ESPI_LS_VW_IDX_SUS_ACK, wire);
++	LOG_DBG("sent SUS_ACK=%u (VW idx 0x%02x)", level, ESPI_LS_VW_IDX_SUS_ACK);
+ }
+ 
+ static void espi_send_boot_done(const struct device *dev)
+ {
+-    vw_tx_msgq_put(dev,ESPI_SEND_BOOT_DONE_TYPE);
++	/* TARGET_BOOT_DONE + TARGET_BOOT_STS (idx 5), same packet as eSPI spec. */
++	espi_vw_tx(dev, 1, 5,
++		   ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_DONE_VLD |
++			   ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_DONE |
++			   ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_STATUS_VLD |
++			   ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_STATUS);
++	LOG_DBG("sent TARGET_BOOT_DONE/STS (VW idx 5)");
+ }
+ 
+-static void espi_send_edge_irq(const struct device *dev,uint8_t idx)
++static void espi_send_edge_irq(const struct device *dev, uint8_t idx)
+ {
+-    vw_tx_msgq_put(dev,idx);
++	espi_vw_tx(dev, 2, idx & 0x80 ? 1 : 0, 1 << 7 | (idx & 0x7f),
++		   idx & 0x80 ? 1 : 0, idx & 0x7f);
+ }
+ 
++static void espi_send_level_irq(const struct device *dev, uint8_t idx, uint8_t active)
++{
++	espi_vw_tx(dev, 1, idx & 0x80 ? 1 : 0, active << 7 | (idx & 0x7f));
++}
+ 
++/*
++ * Leo HAL (reg_espi_type.h) has no CFG_RECOVER_* / *_CFG_R mirrors.
++ * Soft-recover: keep negotiated cfg in SHMEM/BSS (recover_data) and rewrite
++ * the live GEN_CFG / CH*_CFG registers after eSPI reset.
++ */
+ static void espi_reg_init(const struct device *dev)
+ {
+ 	const struct espi_lpc_ls_config *const cfg = dev->config;
+-    struct espi_lpc_ls_data *data = dev->data;
+-    reg_espi_t *reg = cfg->reg;
+-    reg->DW_NPST_ADR = espi_buf_addr_to_reg(dev,np_rx_buf_get(dev));
+-    reg->DW_PSTC_ADR = espi_buf_addr_to_reg(dev,pc_rx_buf_get(dev));
+-    reg->UP_PSTC_ADR = espi_buf_addr_to_reg(dev,pc_tx_buf_get(dev));
+-    reg->UP_VWIR_ADR = espi_buf_addr_to_reg(dev,vw_tx_buf_get(dev));
+-    reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_CNFG_MASK|ESPI_INTR_STT_DN_REST_MASK|ESPI_INTR_STT_PSTC_FREE_MASK|ESPI_INTR_STT_NPST_FREE_MASK
+-                        |ESPI_INTR_STT_DN_VWIR_02_MASK|ESPI_INTR_STT_DN_VWIR_03_MASK|ESPI_INTR_STT_DN_VWIR_07_MASK;
+-
+-    reg->GEN_CFG = 0<<ESPI_GEN_CFG_IO_MODE_SUPP_POS|0<<ESPI_GEN_CFG_OP_FREQ_POS|0xf<<ESPI_GEN_CFG_CH_SUPP_POS;
+-    reg->PER_CH0_CFG = 1<<ESPI_CH0_CFG_PER_MAX_PLOAD_SUPP_POS|ESPI_CH0_CFG_PER_CH_RDY_MASK;
+-    reg->VWIR_CH1_CFG = 0x1f<<ESPI_CH1_CFG_VWIR_MAX_CNT_SUPP_POS|ESPI_CH1_CFG_VWIR_CH_RDY_MASK;
+-    reg->OOB_CH2_CFG = 1<<ESPI_CH2_CFG_OOB_MAX_PLOAD_SUPP_POS|ESPI_CH2_CFG_OOB_CH_RDY_MASK;
+-    reg->FLS_CH3_CFG = 3<<ESPI_CH3_CFG_FLS_SHARE_MODE_POS|1<<ESPI_CH3_CFG_FLS_MAX_PLOAD_SUPP_POS|ESPI_CH3_CFG_FLS_CH_RDY_MASK;
+-    
+-    if(!memcmp(cfg->recover_data->magic,espi_magic_num,sizeof(espi_magic_num)))
+-    {
+-        reg->CFG_RECOVER_CTL = ESPI_AHB_CFG_WR_MASK | ESPI_CFG_HCLK_EN_MASK;
+-        reg->GEN_CFG_R = cfg->recover_data->gen_cfg;
+-        reg->PER_CH0_CFG_R = cfg->recover_data->per_ch0_cfg;
+-        reg->VWIR_CH1_CFG_R = cfg->recover_data->vwir_ch1_cfg;
+-        reg->OOB_CH2_CFG_R = cfg->recover_data->oob_ch2_cfg;
+-        reg->FLS_CH3_CFG_R = cfg->recover_data->fls_ch3_cfg;
+-        gpio_init_callback(&data->u.espi.cs_cb,espi_cs_callback,1<<cfg->cs.pin);
+-        gpio_add_callback_dt(&cfg->cs,&data->u.espi.cs_cb);
+-        gpio_pin_interrupt_configure_dt(&cfg->cs,GPIO_INT_EDGE_RISING);
+-        reg->STATUS_SET = ESPI_STATUS_ALERT_SET_MASK|ESPI_STATUS_SET_VWIRE_FREE_MASK
+-                        |ESPI_STATUS_SET_OOB_FREE_MASK|ESPI_STATUS_SET_NP_FREE_MASK
+-                        |ESPI_STATUS_SET_PC_FREE_MASK|ESPI_STATUS_SET_FLASH_C_FREE_MASK
+-                        |ESPI_STATUS_SET_FLASH_NP_FREE_MASK;
+-    }else
+-    {
+-        reg->STATUS_SET = ESPI_STATUS_ALERT_CLEAR_MASK|ESPI_STATUS_SET_VWIRE_FREE_MASK
+-                        |ESPI_STATUS_SET_OOB_FREE_MASK|ESPI_STATUS_SET_NP_FREE_MASK
+-                        |ESPI_STATUS_SET_PC_FREE_MASK|ESPI_STATUS_SET_FLASH_C_FREE_MASK
+-                        |ESPI_STATUS_SET_FLASH_NP_FREE_MASK;
+-        espi_send_boot_done(dev);
+-    }
+-    reg->INTERRUPT_MASK = ESPI_INTR_STT_DN_CNFG_MASK|ESPI_INTR_STT_DN_REST_MASK
+-                        |ESPI_INTR_STT_PSTC_FREE_MASK|ESPI_INTR_STT_NPST_FREE_MASK|ESPI_INTR_STT_VWIR_AVAL_MASK
+-                        |ESPI_INTR_STT_DN_VWIR_02_MASK|ESPI_INTR_STT_DN_VWIR_03_MASK|ESPI_INTR_STT_DN_VWIR_07_MASK;
++	reg_espi_t *reg = cfg->reg;
++	bool soft_recover = (memcmp(cfg->recover_data->magic, espi_magic_num,
++				     sizeof(espi_magic_num)) == 0);
++
++	reg->DW_NPST_ADR = espi_buf_addr_to_reg(dev, np_rx_buf_get(dev));
++	reg->DW_PSTC_ADR = espi_buf_addr_to_reg(dev, pc_rx_buf_get(dev));
++	reg->UP_PSTC_ADR = espi_buf_addr_to_reg(dev, pc_tx_buf_get(dev));
++	reg->UP_VWIR_ADR = espi_buf_addr_to_reg(dev, vw_tx_buf_get(dev));
++	reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_CNFG_MASK | ESPI_INTR_STT_DN_REST_MASK |
++			       ESPI_INTR_STT_PSTC_FREE_MASK | ESPI_INTR_STT_NPST_FREE_MASK |
++			       ESPI_INTR_STT_DN_VWIR_02_MASK | ESPI_INTR_STT_DN_VWIR_03_MASK |
++			       ESPI_INTR_STT_DN_VWIR_07_MASK | ESPI_INTR_STT_DN_VWIR_P00_MASK |
++			       ESPI_INTR_STT_DN_VWIR_P01_MASK;
++
++	if (soft_recover) {
++		reg->GEN_CFG = cfg->recover_data->gen_cfg;
++		reg->PER_CH0_CFG = cfg->recover_data->per_ch0_cfg;
++		reg->VWIR_CH1_CFG = cfg->recover_data->vwir_ch1_cfg;
++		reg->OOB_CH2_CFG = cfg->recover_data->oob_ch2_cfg;
++		reg->FLS_CH3_CFG = cfg->recover_data->fls_ch3_cfg;
++		reg->STATUS_SET = ESPI_STATUS_ALERT_SET_MASK | ESPI_STATUS_SET_VWIRE_FREE_MASK |
++				  ESPI_STATUS_SET_OOB_FREE_MASK | ESPI_STATUS_SET_NP_FREE_MASK |
++				  ESPI_STATUS_SET_PC_FREE_MASK | ESPI_STATUS_SET_FLASH_C_FREE_MASK |
++				  ESPI_STATUS_SET_FLASH_NP_FREE_MASK;
++	} else {
++		reg->GEN_CFG = (0 << ESPI_GEN_CFG_IO_MODE_SUPP_POS) |
++			       (0 << ESPI_GEN_CFG_OP_FREQ_POS) |
++			       (0xf << ESPI_GEN_CFG_CH_SUPP_POS);
++		reg->PER_CH0_CFG = (1 << ESPI_CH0_CFG_PER_MAX_PLOAD_SUPP_POS) |
++				   ESPI_CH0_CFG_PER_CH_RDY_MASK;
++		reg->VWIR_CH1_CFG = (0x1f << ESPI_CH1_CFG_VWIR_MAX_CNT_SUPP_POS) |
++				    ESPI_CH1_CFG_VWIR_CH_RDY_MASK;
++		reg->OOB_CH2_CFG = (1 << ESPI_CH2_CFG_OOB_MAX_PLOAD_SUPP_POS) |
++				  ESPI_CH2_CFG_OOB_CH_RDY_MASK;
++		/* SHARE_SUPP is 2 bits @16; SHARE_MODE is 1 bit @11 (MAFS=0). */
++		reg->FLS_CH3_CFG = (3 << ESPI_CH3_CFG_FLS_SHARE_SUPP_POS) |
++				  (1 << ESPI_CH3_CFG_FLS_MAX_PLOAD_SUPP_POS) |
++				  ESPI_CH3_CFG_FLS_CH_RDY_MASK;
++		reg->STATUS_SET = ESPI_STATUS_ALERT_CLEAR_MASK | ESPI_STATUS_SET_VWIRE_FREE_MASK |
++				  ESPI_STATUS_SET_OOB_FREE_MASK | ESPI_STATUS_SET_NP_FREE_MASK |
++				  ESPI_STATUS_SET_PC_FREE_MASK | ESPI_STATUS_SET_FLASH_C_FREE_MASK |
++				  ESPI_STATUS_SET_FLASH_NP_FREE_MASK;
++		/*
++		 * Do not send BOOT_DONE here (PRE_KERNEL / pre-host).
++		 * NPCX/IT8xxx2 send it after host enables VW (or Flash) channel.
++		 */
++	}
++
++	/* Default platform indices: P00=0x40 (SUS_ACK dir), P01=0x41 (SUS_WARN). */
++	reg->DN_VWIR_IDX_CTRL0 = 0x43424140;
++	reg->DN_VWIR_IDX_CTRL1 = 0x47464544;
++
++	reg->INTERRUPT_MASK = ESPI_INTR_STT_DN_CNFG_MASK | ESPI_INTR_STT_DN_REST_MASK |
++			      ESPI_INTR_STT_PSTC_FREE_MASK | ESPI_INTR_STT_NPST_FREE_MASK |
++			      ESPI_INTR_STT_DN_VWIR_02_MASK | ESPI_INTR_STT_DN_VWIR_03_MASK |
++			      ESPI_INTR_STT_DN_VWIR_07_MASK | ESPI_INTR_STT_DN_VWIR_P00_MASK |
++			      ESPI_INTR_STT_DN_VWIR_P01_MASK;
++
++	/* Allow BOOT_DONE again after eSPI reset / re-init. */
++	{
++		struct espi_lpc_ls_data *data = dev->data;
++
++		data->vw_boot_done_sent = false;
++		data->vw_sus_warn_last = -1;
++	}
+ }
++
+ static int espi_reset(const struct device *dev)
+ {
+-    const struct espi_lpc_ls_config *dev_config = dev->config;
+-    int ret = 0;
++	const struct espi_lpc_ls_config *dev_config = dev->config;
++
+ #if defined(CONFIG_RESET)
+-    if (dev_config->reset.dev != NULL) {
+-        if (!device_is_ready(dev_config->reset.dev)) {
+-            LOG_ERR("Reset controller device is not ready");
+-            return -ENODEV;
+-        }
+-
+-        ret = reset_line_toggle(dev_config->reset.dev, dev_config->reset.id);
+-        if (ret != 0) {
+-            LOG_ERR("toggle reset line failed");
+-            return ret;
+-        }
+-    }
++	int ret = 0;
++
++	if (dev_config->reset.dev != NULL) {
++		if (!device_is_ready(dev_config->reset.dev)) {
++			LOG_ERR("Reset controller device is not ready");
++			return -ENODEV;
++		}
++
++		ret = reset_line_toggle(dev_config->reset.dev, dev_config->reset.id);
++		if (ret != 0) {
++			LOG_ERR("toggle reset line failed");
++			return ret;
++		}
++	}
++#else
++	ARG_UNUSED(dev_config);
+ #endif
+-    espi_reg_init(dev);
+-    return 0;
++	espi_reg_init(dev);
++	return 0;
+ }
+ 
+-
+ static void ls_espi_isr(void *arg)
+ {
+-	struct device *dev = (struct device *) arg;
++	struct device *dev = (struct device *)arg;
+ 	const struct espi_lpc_ls_config *cfg = dev->config;
+ 	struct espi_lpc_ls_data *data = dev->data;
+-    reg_espi_t *reg = cfg->reg;
+-    uint32_t stt = reg->INTERRUPT_STT;
+-    if(stt&ESPI_INTR_STT_PSTC_FREE_MASK)
+-    {
++	reg_espi_t *reg = cfg->reg;
++	uint32_t stt = reg->INTERRUPT_STT;
++
++	/* Verbose Host IO path — DBG only (INF floods and drops VW logs). */
++	LOG_DBG("isr enter stt=0x%08x mask=0x%08x", stt, reg->INTERRUPT_MASK);
++
++	if (stt & ESPI_INTR_STT_PSTC_FREE_MASK) {
+ 		uint8_t *rx = pc_rx_buf_get(dev);
+ 		uint8_t opcode = rx[0];
++
++		LOG_DBG("isr PC_FREE opcode=0x%02x", opcode);
+ 		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_PSTC_FREE_MASK;
+-		if((opcode&~0x3)==0x4c) //PUT_MEMWR32_SHORT
+-		{
++		if ((opcode & ~0x3) == 0x4c) { /* PUT_MEMWR32_SHORT */
+ 			uint8_t len = (opcode & 0x3) + 1;
+-			uint32_t addr = rx[1]<<24|rx[2]<<16|rx[3]<<8|rx[4];
+-			memwr_short(data,len,addr,&rx[5]);
++			uint32_t addr = rx[1] << 24 | rx[2] << 16 | rx[3] << 8 | rx[4];
++
++			memwr_short(data, len, addr, &rx[5]);
+ 		}
+-        reg->STATUS_SET = ESPI_STATUS_SET_PC_FREE_MASK;
+-    }
+-    if(stt&ESPI_INTR_STT_NPST_FREE_MASK)
+-    {
++		reg->STATUS_SET = ESPI_STATUS_SET_PC_FREE_MASK;
++	}
++	if (stt & ESPI_INTR_STT_NPST_FREE_MASK) {
+ 		uint8_t *rx = np_rx_buf_get(dev);
+ 		uint8_t opcode = rx[0];
+-        reg->INTERRUPT_CLEAR = ESPI_INTR_STT_NPST_FREE_MASK;
+-		if((opcode&~0xf)==0x40)
+-		{
++
++		LOG_DBG("isr NP_FREE opcode=0x%02x", opcode);
++		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_NPST_FREE_MASK;
++		if ((opcode & ~0xf) == 0x40) {
+ 			uint32_t up_first_word = 0;
+ 			uint16_t up_len = 1;
+-			uint8_t len = (opcode&0x3) + 1;
+-			uint8_t *up_data_remain = pc_tx_buf_get(dev); 
+-			uint32_t res;
+-			if(opcode&0x8)	//PUT_MEMRD32_SHORT
+-			{
+-				uint32_t addr = rx[1]<<24|rx[2]<<16|rx[3]<<8|rx[4];
+-				memrd_short(data,len,addr,&res);
+-				mem_io_rd_rsp_pkt_build(len,res,up_data_remain,&up_first_word,&up_len);
+-			}else
+-			{
+-				uint16_t addr = rx[1]<<8 | rx[2];
+-                bool success;
+-				if(opcode&0x4) //PUT_IOWR_SHORT
+-				{
+-					success = iowr_short(data,len,addr,&rx[3]);
+-                    up_first_word = 6;
+-                    up_len = 3;
+-				}else	//PUT_IORD_SHORT
+-				{
+-					success = iord_short(data,len,addr,&res);
+-					mem_io_rd_rsp_pkt_build(len,res,up_data_remain,&up_first_word,&up_len);
++			uint8_t len = (opcode & 0x3) + 1;
++			uint8_t *up_data_remain = pc_tx_buf_get(dev);
++			uint32_t res = 0;
++
++			if (opcode & 0x8) { /* PUT_MEMRD32_SHORT */
++				uint32_t addr = rx[1] << 24 | rx[2] << 16 | rx[3] << 8 | rx[4];
++
++				memrd_short(data, len, addr, &res);
++				mem_io_rd_rsp_pkt_build(len, res, up_data_remain, &up_first_word,
++							&up_len);
++			} else {
++				uint16_t addr = rx[1] << 8 | rx[2];
++				bool success;
++
++				if (opcode & 0x4) { /* PUT_IOWR_SHORT */
++					success = iowr_short(data, len, addr, &rx[3]);
++					up_first_word = 6;
++					up_len = 3;
++				} else { /* PUT_IORD_SHORT */
++					success = iord_short(data, len, addr, &res);
++					mem_io_rd_rsp_pkt_build(len, res, up_data_remain,
++								&up_first_word, &up_len);
++				}
++				if (!success) {
++					up_first_word = 0xe;
++					up_len = 3;
+ 				}
+-                if(!success)
+-                {
+-                    up_first_word = 0xe;
+-                    up_len = 3;
+-                }
+ 			}
+-            reg->UP_PSTC_DAT = up_first_word;
+-            reg->UP_PSTC_LEN_M1 = up_len - 1;
++			reg->UP_PSTC_DAT = up_first_word;
++			reg->UP_PSTC_LEN_M1 = up_len - 1;
+ 		}
+-        reg->STATUS_SET = ESPI_STATUS_ALERT_SET_MASK | ESPI_STATUS_SET_PC_AVAIL_MASK | ESPI_STATUS_SET_NP_FREE_MASK;
+-    }
+-    if(stt&ESPI_INTR_STT_VWIR_FREE_MASK)
+-    {
+-
+-    }
+-    if(stt&ESPI_INTR_STT_OOBP_FREE_MASK)
+-    {
+-
+-    }
+-    if(stt&ESPI_INTR_STT_VWIR_AVAL_MASK)
+-    {
+-        reg->INTERRUPT_CLEAR = ESPI_INTR_STT_VWIR_AVAL_MASK;
+-        k_sem_give(&data->u.espi.vw_tx_sem);
+-    }
+-    if(stt&ESPI_INTR_STT_DN_CNFG_MASK)
+-    {
+-        cfg->recover_data->gen_cfg = reg->GEN_CFG;
+-        cfg->recover_data->per_ch0_cfg = reg->PER_CH0_CFG;
+-        cfg->recover_data->vwir_ch1_cfg = reg->VWIR_CH1_CFG;
+-        cfg->recover_data->oob_ch2_cfg = reg->OOB_CH2_CFG;
+-        cfg->recover_data->fls_ch3_cfg = reg->FLS_CH3_CFG;
+-        memcpy(cfg->recover_data->magic,espi_magic_num,sizeof(espi_magic_num));
+-        reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_CNFG_MASK;
+-
+-    }
+-    if(stt&ESPI_INTR_STT_DN_VWIR_02_MASK)
+-    {
+-        uint32_t dn_vwir_sys0 = reg->DN_VWIR_SYS0;
+-        cfg->sysevent_base->s02_ms = dn_vwir_sys0>>16&0xf;
+-        espi_vwire_msg_send(&cfg->hb_exch,2);
+-        reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_VWIR_02_MASK;
+-
+-    }
+-    if(stt&ESPI_INTR_STT_DN_VWIR_03_MASK)
+-    {
+-        uint32_t dn_vwir_sys0 = reg->DN_VWIR_SYS0;
+-        uint8_t s03 = dn_vwir_sys0>>24&0xf;
+-        cfg->sysevent_base->s03_ms = s03;
+-        espi_vwire_msg_send(&cfg->hb_exch,3);
+-        if(s03&ESPI_SYS_EVT_3_OOB_RST_WARN)
+-        {
++		reg->STATUS_SET = ESPI_STATUS_ALERT_SET_MASK | ESPI_STATUS_SET_PC_AVAIL_MASK |
++				  ESPI_STATUS_SET_NP_FREE_MASK;
++	}
++	if (stt & ESPI_INTR_STT_DN_CNFG_MASK) {
++		bool vw_en;
++
++		cfg->recover_data->gen_cfg = reg->GEN_CFG;
++		cfg->recover_data->per_ch0_cfg = reg->PER_CH0_CFG;
++		cfg->recover_data->vwir_ch1_cfg = reg->VWIR_CH1_CFG;
++		cfg->recover_data->oob_ch2_cfg = reg->OOB_CH2_CFG;
++		cfg->recover_data->fls_ch3_cfg = reg->FLS_CH3_CFG;
++		memcpy(cfg->recover_data->magic, espi_magic_num, sizeof(espi_magic_num));
++		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_CNFG_MASK;
++
++		vw_en = (reg->VWIR_CH1_CFG & ESPI_CH1_CFG_VWIR_CH_EN_MASK) != 0;
++		LOG_DBG("isr DN_CNFG gen=0x%08x vw=0x%08x peri=0x%08x oob=0x%08x fls=0x%08x",
++			reg->GEN_CFG, reg->VWIR_CH1_CFG, reg->PER_CH0_CFG, reg->OOB_CH2_CFG,
++			reg->FLS_CH3_CFG);
++		if (vw_en) {
++			espi_ls_notify(dev, ESPI_BUS_EVENT_CHANNEL_READY, ESPI_CHANNEL_VWIRE, 1);
++			/*
++			 * Host enabled VW channel — send TARGET_BOOT_DONE/STS now
++			 * (same timing as NPCX espi_vw_send_bootload_done).
++			 */
++			if (IS_ENABLED(CONFIG_ESPI_AUTOMATIC_BOOT_DONE_ACKNOWLEDGE) &&
++			    !data->vw_boot_done_sent) {
++				espi_send_boot_done(dev);
++				data->vw_boot_done_sent = true;
++			}
++		} else {
++			data->vw_boot_done_sent = false;
++			espi_ls_notify(dev, ESPI_BUS_EVENT_CHANNEL_READY, ESPI_CHANNEL_VWIRE, 0);
++		}
++		if (reg->PER_CH0_CFG & ESPI_CH0_CFG_PER_CH_EN_MASK) {
++			espi_ls_notify(dev, ESPI_BUS_EVENT_CHANNEL_READY, ESPI_CHANNEL_PERIPHERAL,
++				       1);
++		}
++		if (reg->OOB_CH2_CFG & ESPI_CH2_CFG_OOB_CH_EN_MASK) {
++			espi_ls_notify(dev, ESPI_BUS_EVENT_CHANNEL_READY, ESPI_CHANNEL_OOB, 1);
++		}
++		if (reg->FLS_CH3_CFG & ESPI_CH3_CFG_FLS_CH_EN_MASK) {
++			espi_ls_notify(dev, ESPI_BUS_EVENT_CHANNEL_READY, ESPI_CHANNEL_FLASH, 1);
++		}
++	}
++	if (stt & ESPI_INTR_STT_DN_VWIR_02_MASK) {
++		uint32_t dn_vwir_sys0 = reg->DN_VWIR_SYS0;
++		uint8_t s02 = dn_vwir_sys0 >> 16 & 0xf;
++
++		/* Leo S02: bit0=S5, bit1=S4, bit2=S3 (see espi_lpc_common.h) */
++		LOG_DBG("isr VW idx2 SLP s02=0x%x raw_sys0=0x%08x (bit2_S3=%d bit1_S4=%d bit0_S5=%d)",
++			s02, dn_vwir_sys0,
++			!!(s02 & ESPI_SYS_EVT_2_SLP_S3_N), !!(s02 & ESPI_SYS_EVT_2_SLP_S4_N),
++			!!(s02 & ESPI_SYS_EVT_2_SLP_S5_N));
++		cfg->sysevent_base->s02_ms = s02;
++#ifndef CONFIG_SOC_SERIES_LS101X
++		espi_vwire_msg_send(&cfg->hb_exch, 2);
++#endif
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SLP_S3,
++				  !!(s02 & ESPI_SYS_EVT_2_SLP_S3_N));
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SLP_S4,
++				  !!(s02 & ESPI_SYS_EVT_2_SLP_S4_N));
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SLP_S5,
++				  !!(s02 & ESPI_SYS_EVT_2_SLP_S5_N));
++		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_VWIR_02_MASK;
++	}
++	if (stt & ESPI_INTR_STT_DN_VWIR_03_MASK) {
++		uint32_t dn_vwir_sys0 = reg->DN_VWIR_SYS0;
++		uint8_t s03 = dn_vwir_sys0 >> 24 & 0xf;
++
++		LOG_DBG("isr VW idx3 s03=0x%x (PLTRST=%d OOB_WARN=%d SUS_STAT=%d)", s03,
++			!!(s03 & ESPI_SYS_EVT_3_PLTRST_N), !!(s03 & ESPI_SYS_EVT_3_OOB_RST_WARN),
++			!!(s03 & ESPI_SYS_EVT_3_SUS_STAT_N));
++		cfg->sysevent_base->s03_ms = s03;
++#ifndef CONFIG_SOC_SERIES_LS101X
++		espi_vwire_msg_send(&cfg->hb_exch, 3);
++#endif
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_OOB_RST_WARN,
++				  !!(s03 & ESPI_SYS_EVT_3_OOB_RST_WARN));
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_PLTRST,
++				  !!(s03 & ESPI_SYS_EVT_3_PLTRST_N));
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SUS_STAT,
++				  !!(s03 & ESPI_SYS_EVT_3_SUS_STAT_N));
++		if (s03 & ESPI_SYS_EVT_3_OOB_RST_WARN) {
+ 			espi_send_oob_rst_ack(dev);
+-        }
+-        reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_VWIR_03_MASK;
+-
+-    }
+-    if(stt&ESPI_INTR_STT_DN_VWIR_07_MASK)
+-    {
+-        uint32_t dn_vwir_sys1 = reg->DN_VWIR_SYS1;
+-		uint8_t s07 = dn_vwir_sys1>>24&0xf;
+-        cfg->sysevent_base->s07_ms = s07;
+-        espi_vwire_msg_send(&cfg->hb_exch,7);
+-		if(s07&ESPI_SYS_EVT_7_HOST_RST_WARN)
+-		{
++		}
++		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_VWIR_03_MASK;
++	}
++	if (stt & ESPI_INTR_STT_DN_VWIR_07_MASK) {
++		uint32_t dn_vwir_sys1 = reg->DN_VWIR_SYS1;
++		uint8_t s07 = dn_vwir_sys1 >> 24 & 0xf;
++
++		LOG_DBG("isr VW idx7 s07=0x%x (HOST_RST_WARN=%d)", s07,
++			!!(s07 & ESPI_SYS_EVT_7_HOST_RST_WARN));
++		cfg->sysevent_base->s07_ms = s07;
++#ifndef CONFIG_SOC_SERIES_LS101X
++		espi_vwire_msg_send(&cfg->hb_exch, 7);
++#endif
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_NMIOUT,
++				  !!(s07 & ESPI_SYS_EVT_7_NMIOUT_N));
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SMIOUT,
++				  !!(s07 & ESPI_SYS_EVT_7_SMIOUT_N));
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_HOST_RST_WARN,
++				  !!(s07 & ESPI_SYS_EVT_7_HOST_RST_WARN));
++		if (s07 & ESPI_SYS_EVT_7_HOST_RST_WARN) {
+ 			espi_send_host_rst_ack(dev);
+ 		}
+-        reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_VWIR_07_MASK;
+-    }
+-    if(stt&ESPI_INTR_STT_DN_REST_MASK)
+-    {
+-        reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_REST_MASK;
+-        espi_reset(dev);
+-    }
++		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_VWIR_07_MASK;
++	}
++	if (stt & ESPI_INTR_STT_DN_VWIR_P00_MASK) {
++		uint8_t p00 = reg->DN_VWIR_VAL0 & 0xf;
++
++		/* idx 0x40 is EC→Host (SUS_ACK); Host rarely writes it — log only. */
++		LOG_DBG("isr VW P00 (idx 0x40) val=0x%x", p00);
++		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_VWIR_P00_MASK;
++	}
++	if (stt & ESPI_INTR_STT_DN_VWIR_P01_MASK) {
++		uint8_t p01 = (reg->DN_VWIR_VAL0 >> 8) & 0xf;
++		uint8_t sus_warn = !!(p01 & ESPI_LS_VW_BIT_SUS);
++
++		/*
++		 * idx 0x41 also carries SLP_A / SUS_PWRDN_ACK; any bit change
++		 * raises P01. Only notify (and thus app SUS_ACK) when SUS_WARN
++		 * itself changes — matches Intel VW edge semantics.
++		 */
++		LOG_DBG("isr VW P01 (idx 0x41) p01=0x%x SUS_WARN=%d (last=%d)", p01, sus_warn,
++			data->vw_sus_warn_last);
++		cfg->sysevent_base->s04_sm = p01;
++		if (data->vw_sus_warn_last < 0 || sus_warn != (uint8_t)data->vw_sus_warn_last) {
++			data->vw_sus_warn_last = (int8_t)sus_warn;
++			espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SUS_WARN, sus_warn);
++			if (IS_ENABLED(CONFIG_ESPI_AUTOMATIC_WARNING_ACKNOWLEDGE)) {
++				espi_send_sus_ack(dev, sus_warn);
++			}
++		}
++		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_VWIR_P01_MASK;
++	}
++	if (stt & ESPI_INTR_STT_DN_REST_MASK) {
++		LOG_DBG("isr ESPI_RESET");
++		reg->INTERRUPT_CLEAR = ESPI_INTR_STT_DN_REST_MASK;
++		espi_ls_notify(dev, ESPI_BUS_RESET, 0, 1);
++		espi_reset(dev);
++		espi_ls_notify(dev, ESPI_BUS_RESET, 0, 0);
++	}
++	if (stt == 0U) {
++		LOG_WRN("isr enter with stt=0 (spurious?)");
++	}
+ }
+ 
+-void host_espi_rx_callback(const struct device *dev,void *msg)
++void host_espi_rx_callback(const struct device *dev, void *msg)
+ {
++	struct espi_vwire_msg *vw_msg = msg;
++
++	/* Dual-core path delivers VW index only; expand to SLP group as best-effort. */
++	if (vw_msg->vw_idx == 2) {
++		const struct espi_lpc_ls_config *cfg = dev->config;
++		uint8_t s02 = cfg->sysevent_base->s02_ms;
++
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SLP_S3,
++				  !!(s02 & ESPI_SYS_EVT_2_SLP_S3_N));
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SLP_S4,
++				  !!(s02 & ESPI_SYS_EVT_2_SLP_S4_N));
++		espi_ls_notify_vw(dev, ESPI_VWIRE_SIGNAL_SLP_S5,
++				  !!(s02 & ESPI_SYS_EVT_2_SLP_S5_N));
++	}
++}
+ 
++static int espi_ls_configure(const struct device *dev, struct espi_cfg *cfg)
++{
++	ARG_UNUSED(dev);
++	ARG_UNUSED(cfg);
++	/* Slave capabilities are advertised in espi_reg_init(); host negotiates via bus. */
++	LOG_DBG("espi_config OK (Leo soft-recover path)");
++	return 0;
+ }
+ 
+-static void vw_tx_thread(void *p1,void *p2,void *p3)
++static bool espi_ls_get_channel_status(const struct device *dev, enum espi_channel ch)
+ {
+-    struct vw_tx_msg msg;
+-    while(1)
+-    {
+-        k_msgq_get(&vw_tx_msgq,&msg,K_FOREVER);
+-        switch(msg.type) {
+-        case ESPI_SEND_OOB_RST_ACK_TYPE:
+-	        espi_vw_tx(msg.dev,1,4,ESPI_SYS_EVT_4_OOB_RST_ACK_VLD|ESPI_SYS_EVT_4_OOB_RST_ACK);
+-        break;
+-        case ESPI_SEND_HOST_RST_ACK_TYPE:
+-	        espi_vw_tx(msg.dev,1,6,ESPI_SYS_EVT_6_HOST_RST_ACK_VLD|ESPI_SYS_EVT_6_HOST_RST_ACK);
+-        break;
+-        case ESPI_SEND_BOOT_DONE_TYPE:
+-	        espi_vw_tx(msg.dev,1,5,ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_DONE_VLD|ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_DONE|
+-						ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_STATUS_VLD|ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_STATUS);
+-        break;
+-        default: {
+-            int idx = msg.type;
+-	        espi_vw_tx(msg.dev,2,idx&0x80?1:0,1<<7|(idx&0x7f),idx&0x80?1:0,idx&0x7f);
+-        }break;
+-        }
+-    }
++	const struct espi_lpc_ls_config *cfg = dev->config;
++	reg_espi_t *reg = cfg->reg;
++
++	switch (ch) {
++	case ESPI_CHANNEL_PERIPHERAL:
++		return (reg->PER_CH0_CFG & ESPI_CH0_CFG_PER_CH_EN_MASK) &&
++		       (reg->PER_CH0_CFG & ESPI_CH0_CFG_PER_CH_RDY_MASK);
++	case ESPI_CHANNEL_VWIRE:
++		return (reg->VWIR_CH1_CFG & ESPI_CH1_CFG_VWIR_CH_EN_MASK) &&
++		       (reg->VWIR_CH1_CFG & ESPI_CH1_CFG_VWIR_CH_RDY_MASK);
++	case ESPI_CHANNEL_OOB:
++		return (reg->OOB_CH2_CFG & ESPI_CH2_CFG_OOB_CH_EN_MASK) &&
++		       (reg->OOB_CH2_CFG & ESPI_CH2_CFG_OOB_CH_RDY_MASK);
++	case ESPI_CHANNEL_FLASH:
++		return (reg->FLS_CH3_CFG & ESPI_CH3_CFG_FLS_CH_EN_MASK) &&
++		       (reg->FLS_CH3_CFG & ESPI_CH3_CFG_FLS_CH_RDY_MASK);
++	default:
++		return false;
++	}
+ }
+ 
+-K_KERNEL_THREAD_DEFINE(espi_vw_tx_thread,CONFIG_ESPI_VW_TX_THREAD_STACK_SIZE,vw_tx_thread,NULL,NULL,NULL,CONFIG_ESPI_VW_TX_THREAD_PRIORITY,0,0);
++static int espi_ls_read_lpc_request(const struct device *dev,
++				    enum lpc_peripheral_opcode op, uint32_t *data)
++{
++	ARG_UNUSED(dev);
++	ARG_UNUSED(op);
++	ARG_UNUSED(data);
++	/* Phase A: peri/KCS via ESPI_LPC deferred to stage C. */
++	return -ENOTSUP;
++}
++
++static int espi_ls_write_lpc_request(const struct device *dev,
++				     enum lpc_peripheral_opcode op, uint32_t *data)
++{
++	ARG_UNUSED(dev);
++	ARG_UNUSED(op);
++	ARG_UNUSED(data);
++	return -ENOTSUP;
++}
++
++static int espi_ls_send_vwire(const struct device *dev, enum espi_vwire_signal vw,
++			      uint8_t level)
++{
++	const struct espi_lpc_ls_config *cfg = dev->config;
++	uint8_t wire;
++
++	switch (vw) {
++	case ESPI_VWIRE_SIGNAL_OOB_RST_ACK:
++		wire = ESPI_SYS_EVT_4_OOB_RST_ACK_VLD;
++		if (level) {
++			wire |= ESPI_SYS_EVT_4_OOB_RST_ACK;
++		}
++		espi_vw_tx(dev, 1, 4, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_PME:
++		wire = ESPI_SYS_EVT_4_PME_N_VLD;
++		if (!level) {
++			wire |= ESPI_SYS_EVT_4_PME_N;
++		}
++		espi_vw_tx(dev, 1, 4, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_WAKE:
++		wire = ESPI_SYS_EVT_4_WAKE_N_VLD;
++		if (!level) {
++			wire |= ESPI_SYS_EVT_4_WAKE_N;
++		}
++		espi_vw_tx(dev, 1, 4, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_TARGET_BOOT_DONE:
++		wire = ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_DONE_VLD;
++		if (level) {
++			wire |= ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_DONE;
++		}
++		espi_vw_tx(dev, 1, 5, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_TARGET_BOOT_STS:
++		wire = ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_STATUS_VLD;
++		if (level) {
++			wire |= ESPI_SYS_EVT_5_SLAVE_BOOT_LOAD_STATUS;
++		}
++		espi_vw_tx(dev, 1, 5, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_ERR_NON_FATAL:
++		wire = ESPI_SYS_EVT_5_ERROR_NONFATAL_VLD;
++		if (level) {
++			wire |= ESPI_SYS_EVT_5_ERROR_NONFATAL;
++		}
++		espi_vw_tx(dev, 1, 5, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_ERR_FATAL:
++		wire = ESPI_SYS_EVT_5_ERROR_FATAL_VLD;
++		if (level) {
++			wire |= ESPI_SYS_EVT_5_ERROR_FATAL;
++		}
++		espi_vw_tx(dev, 1, 5, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_HOST_RST_ACK:
++		wire = ESPI_SYS_EVT_6_HOST_RST_ACK_VLD;
++		if (level) {
++			wire |= ESPI_SYS_EVT_6_HOST_RST_ACK;
++		}
++		espi_vw_tx(dev, 1, 6, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_SCI:
++		wire = ESPI_SYS_EVT_6_SCI_N_VLD;
++		if (!level) {
++			wire |= ESPI_SYS_EVT_6_SCI_N;
++		}
++		espi_vw_tx(dev, 1, 6, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_SMI:
++		wire = ESPI_SYS_EVT_6_SMI_N_VLD;
++		if (!level) {
++			wire |= ESPI_SYS_EVT_6_SMI_N;
++		}
++		espi_vw_tx(dev, 1, 6, wire);
++		break;
++	case ESPI_VWIRE_SIGNAL_SUS_ACK:
++		espi_send_sus_ack(dev, level);
++		break;
++	case ESPI_VWIRE_SIGNAL_DNX_ACK:
++		cfg->sysevent_base->s06_sm = level ? 0x0f : 0x00;
++		espi_vw_tx(dev, 1, 6, cfg->sysevent_base->s06_sm);
++		break;
++	default:
++		LOG_WRN("send_vwire unsupported %d", vw);
++		return -ENOTSUP;
++	}
++
++	return 0;
++}
++
++static int espi_ls_receive_vwire(const struct device *dev, enum espi_vwire_signal vw,
++				 uint8_t *level)
++{
++	const struct espi_lpc_ls_config *cfg = dev->config;
++
++	if (level == NULL) {
++		return -EINVAL;
++	}
++
++	switch (vw) {
++	case ESPI_VWIRE_SIGNAL_SLP_S3:
++		*level = (cfg->sysevent_base->s02_ms & ESPI_SYS_EVT_2_SLP_S3_N) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_SLP_S4:
++		*level = (cfg->sysevent_base->s02_ms & ESPI_SYS_EVT_2_SLP_S4_N) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_SLP_S5:
++		*level = (cfg->sysevent_base->s02_ms & ESPI_SYS_EVT_2_SLP_S5_N) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_OOB_RST_WARN:
++		*level = (cfg->sysevent_base->s03_ms & ESPI_SYS_EVT_3_OOB_RST_WARN) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_PLTRST:
++		*level = (cfg->sysevent_base->s03_ms & ESPI_SYS_EVT_3_PLTRST_N) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_SUS_STAT:
++		*level = (cfg->sysevent_base->s03_ms & ESPI_SYS_EVT_3_SUS_STAT_N) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_NMIOUT:
++		*level = (cfg->sysevent_base->s07_ms & ESPI_SYS_EVT_7_NMIOUT_N) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_SMIOUT:
++		*level = (cfg->sysevent_base->s07_ms & ESPI_SYS_EVT_7_SMIOUT_N) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_HOST_RST_WARN:
++		*level = (cfg->sysevent_base->s07_ms & ESPI_SYS_EVT_7_HOST_RST_WARN) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_SUS_WARN:
++		*level = (cfg->sysevent_base->s04_sm & ESPI_LS_VW_BIT_SUS) ? 1 : 0;
++		break;
++	case ESPI_VWIRE_SIGNAL_SLP_A:
++	case ESPI_VWIRE_SIGNAL_SUS_PWRDN_ACK:
++	case ESPI_VWIRE_SIGNAL_SLP_WLAN:
++	case ESPI_VWIRE_SIGNAL_SLP_LAN:
++	case ESPI_VWIRE_SIGNAL_HOST_C10:
++	case ESPI_VWIRE_SIGNAL_DNX_WARN:
++		*level = 0;
++		break;
++	default:
++		return -ENOTSUP;
++	}
++
++	return 0;
++}
++
++static int espi_ls_send_oob(const struct device *dev, struct espi_oob_packet *pckt)
++{
++	ARG_UNUSED(dev);
++	ARG_UNUSED(pckt);
++	return -ENOTSUP;
++}
++
++static int espi_ls_receive_oob(const struct device *dev, struct espi_oob_packet *pckt)
++{
++	ARG_UNUSED(dev);
++	ARG_UNUSED(pckt);
++	return -ENOTSUP;
++}
++
++static int espi_ls_flash_read(const struct device *dev, struct espi_flash_packet *pckt)
++{
++	ARG_UNUSED(dev);
++	ARG_UNUSED(pckt);
++	return -ENOTSUP;
++}
++
++static int espi_ls_flash_write(const struct device *dev, struct espi_flash_packet *pckt)
++{
++	ARG_UNUSED(dev);
++	ARG_UNUSED(pckt);
++	return -ENOTSUP;
++}
++
++static int espi_ls_flash_erase(const struct device *dev, struct espi_flash_packet *pckt)
++{
++	ARG_UNUSED(dev);
++	ARG_UNUSED(pckt);
++	return -ENOTSUP;
++}
++
++static int espi_ls_manage_callback(const struct device *dev, struct espi_callback *callback,
++				   bool set)
++{
++	struct espi_lpc_ls_data *data = dev->data;
++
++	return espi_manage_callback(&data->callbacks, callback, set);
++}
+ 
+ static int espi_ls_init(const struct device *dev)
+ {
+ 	const struct espi_lpc_ls_config *const dev_config = dev->config;
+ 	struct espi_lpc_ls_data *const data = dev->data;
+-    bool inited = false;
+-    __maybe_unused int ret;
+-    data->cfg = dev_config;
++	bool inited = false;
++	__maybe_unused int ret;
++
++	data->cfg = dev_config;
+ 	sys_slist_init(&data->peri_io);
+ 	sys_slist_init(&data->peri_mem);
++	sys_slist_init(&data->callbacks);
++	data->vw_sus_warn_last = -1;
++	ls_port80_content.ctx = (void *)dev;
++	espi_lpc_add_ioport(dev, &ls_port80_io);
+ 
+ #if defined(CONFIG_CLOCK_CONTROL)
+-    if (dev_config->ccfg.cctl_dev) {
+-        const struct device *clk_dev = dev_config->ccfg.cctl_dev;
+-        if (!device_is_ready(clk_dev)) {
+-            LOG_DBG("%s device not ready", clk_dev->name);
+-            return -ENODEV;
+-        }
+-        if(clock_control_get_status(clk_dev,(clock_control_subsys_t)&dev_config->ccfg) == CLOCK_CONTROL_STATUS_OFF)
+-        {
+-            clock_control_on(clk_dev, (clock_control_subsys_t)&dev_config->ccfg);
+-        }else
+-        {
+-            inited = true;
+-        }
+-    }
++	if (dev_config->ccfg.cctl_dev) {
++		const struct device *clk_dev = dev_config->ccfg.cctl_dev;
++
++		if (!device_is_ready(clk_dev)) {
++			LOG_DBG("%s device not ready", clk_dev->name);
++			return -ENODEV;
++		}
++		if (clock_control_get_status(clk_dev,
++					     (clock_control_subsys_t)&dev_config->ccfg) ==
++		    CLOCK_CONTROL_STATUS_OFF) {
++			clock_control_on(clk_dev, (clock_control_subsys_t)&dev_config->ccfg);
++		} else {
++			/* Dual-core / warm: peer may already own HW cfg. */
++			inited = true;
++		}
++	}
+ #endif
+-    k_sem_init(&data->u.espi.vw_tx_sem,1,1);
+-    if(inited == false)
+-    {
++
++#ifdef CONFIG_SOC_SERIES_LS101X
++	/*
++	 * Leo single-core: always bring ESPI out of reset and enable pad mux.
++	 * Soft-recover BSS is not shared; never skip reg_init just because
++	 * CLKG already looks ON.
++	 */
++	inited = false;
++	/* Pulse soft-reset (CLR=assert, SET=release), same as SDK MSP pattern. */
++	SYSC_CPU->PD_CPU_SRST = SYSC_CPU_SRST_CLR_ESPI_MASK;
++	SYSC_CPU->PD_CPU_SRST = SYSC_CPU_SRST_SET_ESPI_MASK;
++	/* Second-level IO mux: GPD10..15 + GPD9 alert (manual PIN_SEL0). */
++	REG_FIELD_WR(SYSC_AWO->PIN_SEL0, SYSC_AWO_ESPI_EN, 1);
++	REG_FIELD_WR(SYSC_AWO->PIN_SEL0, SYSC_AWO_ESPI_ALERT_EN, 1);
++	/* Match SDK pinmux_espi_init(): clear OD on eSPI pads. */
++	SYSC_AWO->IO[3].IEN_OD &= ~0xfe000000U;
++#endif
++
++	if (inited == false) {
+ #if defined(CONFIG_PINCTRL)
+-        ret = pinctrl_apply_state(dev_config->pcfg, PINCTRL_STATE_DEFAULT);
+-        if (ret < 0) {
+-            LOG_DBG("%s: Could not configure pins", dev->name);
+-        }
++		if (dev_config->pcfg) {
++			ret = pinctrl_apply_state(dev_config->pcfg, PINCTRL_STATE_DEFAULT);
++			if (ret < 0) {
++				LOG_DBG("%s: Could not configure pins", dev->name);
++			}
++		}
++#endif
++		espi_reg_init(dev);
++	}
++
++	dev_config->irq_config_func(dev);
++	{
++		reg_espi_t *reg = (reg_espi_t *)dev_config->reg;
++
++		LOG_DBG("%s ready irq=%d mask=0x%08x gen=0x%08x vw=0x%08x",
++			dev->name, DT_INST_IRQN(0), reg->INTERRUPT_MASK, reg->GEN_CFG,
++			reg->VWIR_CH1_CFG);
++	}
++	return 0;
++}
++
++static const struct espi_driver_api espi_ls_driver_api = {
++	.config = espi_ls_configure,
++	.get_channel_status = espi_ls_get_channel_status,
++	.read_lpc_request = espi_ls_read_lpc_request,
++	.write_lpc_request = espi_ls_write_lpc_request,
++	.send_vwire = espi_ls_send_vwire,
++	.receive_vwire = espi_ls_receive_vwire,
++	.send_oob = espi_ls_send_oob,
++	.receive_oob = espi_ls_receive_oob,
++	.flash_read = espi_ls_flash_read,
++	.flash_write = espi_ls_flash_write,
++	.flash_erase = espi_ls_flash_erase,
++	.manage_callback = espi_ls_manage_callback,
++};
++
++#define LS_ESPI_CS_SPEC(idx)                                                                           \
++	GPIO_DT_SPEC_INST_GET_OR(idx, cs_gpios, { 0 })
++
++#ifdef CONFIG_SOC_SERIES_LS101X
++#define LS_ESPI_HB_EXCH(idx) { 0 }
++#define LS_ESPI_RECOVER_ATTR
++#else
++#define LS_ESPI_HB_EXCH(idx)                                                                           \
++	HOST_BMC_MSG_EXCH_INIT(idx, host_espi_rx_callback, bmc_espi_rx_callback)
++#define LS_ESPI_RECOVER_ATTR __attribute__((section("SHMEM.99." #idx)))
+ #endif
+-        espi_reg_init(dev);
+-    }
+-
+-    dev_config->irq_config_func(dev);
+-
+-    return 0;
+-}
+-
+-#define LS_ESPI_INIT(idx)\
+-	IF_ENABLED(CONFIG_PINCTRL,(PINCTRL_DT_INST_DEFINE(idx);))\
+-    static void espi_ls_irq_config_func_##idx(const struct device *dev)	\
+-    {\
+-        IRQ_CONNECT(DT_INST_IRQN(idx),DT_INST_IRQ(idx, priority),\
+-                ls_espi_isr,DEVICE_DT_INST_GET(idx), 0);\
+-        irq_enable(DT_INST_IRQN(idx));\
+-    }\
+-    static struct espi_cfg_recover espi_cfg_recover_data_##idx __attribute__((section("SHMEM.99."#idx)));\
+-    static const struct espi_lpc_ls_config espi_ls_cfg_##idx = {\
+-        .reg = (reg_espi_t *)DT_INST_REG_ADDR(idx),\
+-        .irq_config_func = espi_ls_irq_config_func_##idx,\
+-        .raise_edge_irq = espi_send_edge_irq,\
+-        .set_level_irq = NULL,\
+-        .hb_exch = HOST_BMC_MSG_EXCH_INIT(idx,host_espi_rx_callback,bmc_espi_rx_callback),\
+-        .sysevent_base = (struct espi_sysevent_base *)DT_INST_PROP(idx,sysevent_base),\
+-        .recover_data = &espi_cfg_recover_data_##idx,\
+-        .cs = GPIO_DT_SPEC_INST_GET(idx,cs_gpios),\
+-        IF_ENABLED(CONFIG_PINCTRL, (.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx), )) \
+-        IF_ENABLED(DT_HAS_CLOCKS(idx), (.ccfg = LS_DT_CLK_CFG_ITEM(idx), )) \
+-        IF_ENABLED(DT_INST_NODE_HAS_PROP(idx, resets), (.reset = RESET_DT_SPEC_INST_GET(idx), )) \
+-    };\
+-    static struct espi_lpc_ls_data espi_ls_data_##idx;\
+-    DEVICE_DT_INST_DEFINE(idx,espi_ls_init,NULL,&espi_ls_data_##idx,\
+-        &espi_ls_cfg_##idx,PRE_KERNEL_2,CONFIG_ESPI_INIT_PRIORITY,\
+-        NULL);
+-            
+-DT_INST_FOREACH_STATUS_OKAY(LS_ESPI_INIT)
+\ No newline at end of file
++
++#define LS_ESPI_INIT(idx)                                                                              \
++	IF_ENABLED(CONFIG_PINCTRL, (PINCTRL_DT_INST_DEFINE(idx);))                                     \
++	static void espi_ls_irq_config_func_##idx(const struct device *dev)                            \
++	{                                                                                              \
++		ARG_UNUSED(dev);                                                                       \
++		IRQ_CONNECT(DT_INST_IRQN(idx), DT_INST_IRQ(idx, priority), ls_espi_isr,                \
++			    DEVICE_DT_INST_GET(idx), 0);                                               \
++		irq_enable(DT_INST_IRQN(idx));                                                         \
++	}                                                                                              \
++	static struct espi_cfg_recover espi_cfg_recover_data_##idx LS_ESPI_RECOVER_ATTR;               \
++	static const struct espi_lpc_ls_config espi_ls_cfg_##idx = {                                    \
++		.reg = (reg_espi_t *)DT_INST_REG_ADDR(idx),                                            \
++		.irq_config_func = espi_ls_irq_config_func_##idx,                                      \
++		.raise_edge_irq = espi_send_edge_irq,                                                  \
++		.set_level_irq = espi_send_level_irq,                                                  \
++		.hb_exch = LS_ESPI_HB_EXCH(idx),                                                       \
++		.sysevent_base = (struct espi_sysevent_base *)DT_INST_PROP(idx, sysevent_base),         \
++		.recover_data = &espi_cfg_recover_data_##idx,                                          \
++		.cs = LS_ESPI_CS_SPEC(idx),                                                             \
++		IF_ENABLED(CONFIG_PINCTRL, (.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx), ))             \
++		IF_ENABLED(DT_HAS_CLOCKS(idx), (.ccfg = LS_DT_CLK_CFG_ITEM(idx), ))                     \
++		IF_ENABLED(DT_INST_NODE_HAS_PROP(idx, resets), (.reset = RESET_DT_SPEC_INST_GET(idx), ))\
++	};                                                                                             \
++	static struct espi_lpc_ls_data espi_ls_data_##idx;                                              \
++	DEVICE_DT_INST_DEFINE(idx, espi_ls_init, NULL, &espi_ls_data_##idx, &espi_ls_cfg_##idx,         \
++			      PRE_KERNEL_2, CONFIG_ESPI_INIT_PRIORITY, &espi_ls_driver_api);
++
++DT_INST_FOREACH_STATUS_OKAY(LS_ESPI_INIT)
+diff --git a/drivers/espi/espi_ls_sio.c b/drivers/espi/espi_ls_sio.c
+index 70378ad42d3..130b19c325b 100644
+--- a/drivers/espi/espi_ls_sio.c
++++ b/drivers/espi/espi_ls_sio.c
+@@ -1,216 +1,369 @@
+ #define DT_DRV_COMPAT linkedsemi_ls_sio
+ 
+ #include <zephyr/kernel.h>
+-#include <zephyr/dt-bindings/pinctrl/lsqsh-pinctrl.h>
+ #include <zephyr/drivers/espi.h>
+ #include <zephyr/logging/log.h>
+ #include <zephyr/sys/util.h>
+ #include <espi_lpc_common.h>
++#include "espi_ls_sio.h"
+ 
+ LOG_MODULE_REGISTER(sio, CONFIG_ESPI_LOG_LEVEL);
+ 
+ #define PORT_NUM 2
+ 
+-struct ls_ldn_dev {
+-    uint8_t base_addr_lsb;
+-    uint8_t base_addr_msb;
+-    uint8_t enable;
++enum sio_pnp_state {
++	SIO_WAIT_87 = 0,
++	SIO_WAIT_01,
++	SIO_WAIT_55_1,
++	SIO_WAIT_55_2,
++	SIO_PNP_MODE,
++};
++
++struct sio_ldn_slot {
++	uint8_t act;
++	uint8_t irq;
++	uint8_t msb;
++	uint8_t lsb;
++	uint8_t spec1;
++	uint8_t spec2;
++	uint8_t mdrop;
++	const struct device *uart_dev;
++	sio_ls_ldn_cb_t on_change;
+ };
+ 
+ struct sio_ls_data {
+-    struct ls_espi_lpc_struct *parent;
+-    struct peri_ioport_content io_2e;
+-    struct peri_ioport_content io_2f;
+-    struct ls_ldn_dev ldn_2;
+-    struct ls_ldn_dev ldn_3;
+-    struct ls_ldn_dev ldn_4;
+-    struct ls_ldn_dev ldn_7;
+-    struct ls_ldn_dev ldn_b;
+-    struct ls_ldn_dev ldn_c;
+-    struct ls_ldn_dev ldn_d;
+-    struct ls_ldn_dev ldn_e;
+-    struct ls_ldn_dev ldn_f;
+-    struct ls_ldn_dev *ldn;
+-    uint8_t index;
+-    uint8_t ldn_num;
+-    uint8_t reg_2x[16];
+-    struct peri_ioport ioport[PORT_NUM];
++	struct peri_ioport_content io_2e;
++	struct peri_ioport_content io_2f;
++	struct peri_ioport ioport[PORT_NUM];
++	struct sio_ldn_slot ldn[SIO_LS_LDN_COUNT];
++	enum sio_pnp_state pnp;
++	uint8_t index;
++	uint8_t ldn_num;
++	uint8_t clk_sel;
++	uint8_t mmio_reg;
++	uint8_t gpio_sel[5];
++	uint8_t spec_func[4];
++	uint8_t test[2];
+ };
+ 
+ struct sio_ls_config {
+-    const struct device *parent;
+-    uint16_t host_sio_reg;
+-    mem_addr_t reg;
++	const struct device *parent;
++	uint16_t host_sio_reg;
++	uint16_t chip_id;
+ };
+ 
+-static void select_ldn(struct sio_ls_data *sio, uint8_t ldn_num)
++static void ldn_notify(struct sio_ldn_slot *slot)
+ {
+-    switch (ldn_num) {
+-    case 0x2:
+-        sio->ldn = &sio->ldn_2;
+-        break;
+-    case 0x3:
+-        sio->ldn = &sio->ldn_3;
+-        break;
+-    case 0x4:
+-        sio->ldn = &sio->ldn_4;
+-        break;
+-    case 0x7:
+-        sio->ldn = &sio->ldn_7;
+-        break;
+-    case 0xb:
+-        sio->ldn = &sio->ldn_b;
+-        break;
+-    case 0xc:
+-        sio->ldn = &sio->ldn_c;
+-        break;
+-    case 0xd:
+-        sio->ldn = &sio->ldn_d;
+-        break;
+-    case 0xe:
+-        sio->ldn = &sio->ldn_e;
+-        break;
+-    case 0xf:
+-        sio->ldn = &sio->ldn_f;
+-        break;
+-    }
++	if (slot->on_change != NULL && slot->uart_dev != NULL) {
++		slot->on_change(slot->uart_dev);
++	}
+ }
+ 
+-static void io_2e_read(const struct peri_ioport_content *ioport, uint8_t size, void *res)
++int sio_ls_register_uart(const struct device *sio, uint8_t ldn,
++			 const struct device *uart_dev, sio_ls_ldn_cb_t on_change,
++			 uint16_t default_io, uint8_t default_irq)
++{
++	struct sio_ls_data *data;
++
++	if (sio == NULL || uart_dev == NULL || ldn >= SIO_LS_LDN_COUNT) {
++		return -EINVAL;
++	}
++
++	data = sio->data;
++	data->ldn[ldn].uart_dev = uart_dev;
++	data->ldn[ldn].on_change = on_change;
++	data->ldn[ldn].msb = (uint8_t)(default_io >> 8);
++	data->ldn[ldn].lsb = (uint8_t)default_io;
++	data->ldn[ldn].irq = default_irq;
++	data->ldn[ldn].act = 0x01;
++	ldn_notify(&data->ldn[ldn]);
++	return 0;
++}
++
++int sio_ls_ldn_info(const struct device *sio, uint8_t ldn,
++		    struct sio_ls_ldn_info *info)
++{
++	const struct sio_ls_data *data;
++
++	if (sio == NULL || info == NULL || ldn >= SIO_LS_LDN_COUNT) {
++		return -EINVAL;
++	}
++
++	data = sio->data;
++	info->act = data->ldn[ldn].act;
++	info->irq = data->ldn[ldn].irq;
++	info->spec1 = data->ldn[ldn].spec1;
++	info->io_base = ((uint16_t)data->ldn[ldn].msb << 8) | data->ldn[ldn].lsb;
++	return 0;
++}
++
++static uint8_t ldn_read(const struct sio_ldn_slot *slot, uint8_t index)
++{
++	switch (index) {
++	case 0x30:
++		return slot->act;
++	case 0x60:
++		return slot->msb;
++	case 0x61:
++		return slot->lsb;
++	case 0x70:
++		return slot->irq;
++	case 0xf0:
++		return slot->spec1;
++	case 0xf1:
++		return slot->spec2;
++	case 0xf2:
++		return slot->mdrop;
++	default:
++		return 0;
++	}
++}
++
++static void ldn_write(struct sio_ldn_slot *slot, uint8_t index, uint8_t val)
+ {
+-    struct device *dev = ioport->ctx;
+-    struct sio_ls_data *dev_data = dev->data;
++	bool remap = false;
++
++	switch (index) {
++	case 0x30:
++		slot->act = val;
++		remap = true;
++		break;
++	case 0x60:
++		slot->msb = val;
++		remap = true;
++		break;
++	case 0x61:
++		slot->lsb = val;
++		remap = true;
++		break;
++	case 0x70:
++		slot->irq = val;
++		remap = true;
++		break;
++	case 0xf0:
++		slot->spec1 = val;
++		break;
++	case 0xf1:
++		slot->spec2 = val;
++		break;
++	case 0xf2:
++		slot->mdrop = val;
++		break;
++	default:
++		break;
++	}
++
++	if (remap) {
++		ldn_notify(slot);
++	}
++}
+ 
+-    uint8_t *val = res;
++static void io_2e_read(const struct peri_ioport_content *ioport, uint8_t size, void *res)
++{
++	struct device *dev = ioport->ctx;
++	struct sio_ls_data *data = dev->data;
++	uint8_t *val = res;
+ 
+-    *val = dev_data->index;
++	ARG_UNUSED(size);
++	*val = (data->pnp == SIO_PNP_MODE) ? data->index : 0;
+ }
+ 
+ static void io_2e_write(const struct peri_ioport_content *ioport, uint8_t size, uint8_t *data)
+ {
+-    struct device *dev = ioport->ctx;
+-    struct sio_ls_data *dev_data = dev->data;
++	struct device *dev = ioport->ctx;
++	struct sio_ls_data *dev_data = dev->data;
++	uint8_t val = *data;
++
++	ARG_UNUSED(size);
++
++	if (dev_data->pnp == SIO_PNP_MODE) {
++		dev_data->index = val;
++		return;
++	}
+ 
+-    dev_data->index = *data;
++	switch (dev_data->pnp) {
++	case SIO_WAIT_87:
++		if (val == 0x87) {
++			dev_data->pnp = SIO_WAIT_01;
++		}
++		break;
++	case SIO_WAIT_01:
++		if (val == 0x01) {
++			dev_data->pnp = SIO_WAIT_55_1;
++		}
++		break;
++	case SIO_WAIT_55_1:
++		if (val == 0x55) {
++			dev_data->pnp = SIO_WAIT_55_2;
++		}
++		break;
++	case SIO_WAIT_55_2:
++		if (val == 0x55) {
++			dev_data->pnp = SIO_PNP_MODE;
++		}
++		break;
++	default:
++		break;
++	}
+ }
+ 
+-static uint8_t ldn_dev_read(struct ls_ldn_dev *ldn, uint8_t index)
++static uint8_t cfg_read(const struct device *dev, uint8_t index)
+ {
+-    uint8_t val = 0;
+-
+-    switch (index) {
+-    case 0x30:
+-        val = ldn->enable;
+-        break;
+-    case 0x60:
+-        val = ldn->base_addr_msb;
+-        break;
+-    case 0x61:
+-        val = ldn->base_addr_lsb;
+-        break;
+-    }
+-    return val;
++	const struct sio_ls_config *cfg = dev->config;
++	struct sio_ls_data *data = dev->data;
++
++	if (index == 0x07) {
++		return data->ldn_num;
++	}
++	if (index == 0x02) {
++		return (data->pnp == SIO_PNP_MODE) ? 0x02 : 0;
++	}
++	if (index == 0x20) {
++		return (uint8_t)(cfg->chip_id >> 8);
++	}
++	if (index == 0x21) {
++		return (uint8_t)cfg->chip_id;
++	}
++	if (index == 0x22) {
++		return 0x02;
++	}
++	if (index == 0x23) {
++		return data->clk_sel;
++	}
++	if (index == 0x24) {
++		return data->mmio_reg;
++	}
++	if (index >= 0x25 && index <= 0x29) {
++		return data->gpio_sel[index - 0x25];
++	}
++	if (index >= 0x2a && index <= 0x2d) {
++		return data->spec_func[index - 0x2a];
++	}
++	if (index == 0x2e) {
++		return data->test[0];
++	}
++	if (index == 0x2f) {
++		return data->test[1];
++	}
++	if (data->ldn_num < SIO_LS_LDN_COUNT) {
++		return ldn_read(&data->ldn[data->ldn_num], index);
++	}
++	return 0;
+ }
+ 
+ static void io_2f_read(const struct peri_ioport_content *ioport, uint8_t size, void *res)
+ {
+-    struct device *dev = ioport->ctx;
+-    struct sio_ls_data *dev_data = dev->data;
+-
+-    uint8_t *val = res;
+-
+-    if (dev_data->index == 0x7) {
+-        *val = dev_data->ldn_num;
+-    } else if (dev_data->index == 0x20) {
+-        *val = 0x26;
+-    } else if (dev_data->index >= 0x20 && dev_data->index < 0x30) {
+-        *val = dev_data->reg_2x[dev_data->index & 0xf];
+-    } else {
+-        __ASSERT_NO_MSG(dev_data->ldn != NULL);
+-        *val = ldn_dev_read(dev_data->ldn, dev_data->index);
+-    }
++	struct device *dev = ioport->ctx;
++	struct sio_ls_data *data = dev->data;
++	uint8_t *val = res;
++
++	ARG_UNUSED(size);
++	*val = (data->pnp == SIO_PNP_MODE) ? cfg_read(dev, data->index) : 0;
+ }
+ 
+-static void ldn_dev_write(struct ls_ldn_dev *ldn, uint8_t index, uint8_t val)
++static void cfg_write(const struct device *dev, uint8_t index, uint8_t val)
+ {
+-    switch (index) {
+-    case 0x30:
+-        ldn->enable = val;
+-        break;
+-    case 0x60:
+-        ldn->base_addr_msb = val;
+-        break;
+-    case 0x61:
+-        ldn->base_addr_lsb = val;
+-        break;
+-    }
++	struct sio_ls_data *data = dev->data;
++
++	if (index == 0x02) {
++		if (val & 0x02) {
++			data->pnp = SIO_WAIT_87;
++		}
++		return;
++	}
++	if (index == 0x07) {
++		if (val < SIO_LS_LDN_COUNT) {
++			data->ldn_num = val;
++		} else {
++			data->pnp = SIO_WAIT_87;
++		}
++		return;
++	}
++	if (index == 0x23) {
++		data->clk_sel = val;
++		return;
++	}
++	if (index == 0x24) {
++		data->mmio_reg = val;
++		return;
++	}
++	if (index >= 0x25 && index <= 0x29) {
++		if (data->ldn_num == 0x07) {
++			data->gpio_sel[index - 0x25] = val;
++		}
++		return;
++	}
++	if (index >= 0x2a && index <= 0x2d) {
++		data->spec_func[index - 0x2a] = val;
++		return;
++	}
++	if (index == 0x2e || index == 0x2f) {
++		data->test[index - 0x2e] = val;
++		return;
++	}
++	if (data->ldn_num < SIO_LS_LDN_COUNT) {
++		ldn_write(&data->ldn[data->ldn_num], index, val);
++	}
+ }
+ 
+-static void io_2f_write(const struct peri_ioport_content *ioport, uint8_t size, uint8_t *data)
++static void io_2f_write(const struct peri_ioport_content *ioport, uint8_t size, uint8_t *wdata)
+ {
+-    struct device *dev = ioport->ctx;
+-    struct sio_ls_data *dev_data = dev->data;
+-
+-    if (dev_data->index == 0x7) {
+-        dev_data->ldn_num = *data;
+-        select_ldn(dev_data, dev_data->ldn_num);
+-    } else if (dev_data->index >= 0x20 && dev_data->index < 0x30) {
+-        dev_data->reg_2x[dev_data->index & 0xf] = *data;
+-    } else {
+-        __ASSERT_NO_MSG(dev_data->ldn != NULL);
+-        ldn_dev_write(dev_data->ldn, dev_data->index, *data);
+-    }
++	struct device *dev = ioport->ctx;
++	struct sio_ls_data *data = dev->data;
++
++	ARG_UNUSED(size);
++	if (data->pnp == SIO_PNP_MODE) {
++		cfg_write(dev, data->index, *wdata);
++	}
+ }
+ 
+ static int sio_ls_init(const struct device *dev)
+ {
+-    const struct sio_ls_config *dev_cfg = dev->config;
+-    const struct sio_ls_data *dev_data = dev->data;
++	const struct sio_ls_config *cfg = dev->config;
++	struct sio_ls_data *data = dev->data;
++
++	if (!device_is_ready(cfg->parent)) {
++		__ASSERT(0, "%s device not ready", cfg->parent->name);
++		return -ENODEV;
++	}
++
++	data->io_2e.io_read = io_2e_read;
++	data->io_2e.io_write = io_2e_write;
++	data->io_2e.ctx = (struct device *)dev;
++	data->io_2e.addr = cfg->host_sio_reg;
++	data->ioport[0].content = &data->io_2e;
++
++	data->io_2f.io_read = io_2f_read;
++	data->io_2f.io_write = io_2f_write;
++	data->io_2f.ctx = (struct device *)dev;
++	data->io_2f.addr = cfg->host_sio_reg + 1;
++	data->ioport[1].content = &data->io_2f;
+ 
+-    if (!device_is_ready(dev_cfg->parent)) {
+-        __ASSERT(0, "%s device not ready", dev_cfg->parent->name);
+-        return -ENODEV;
+-    }
++	data->spec_func[2] = 1;
++	data->pnp = SIO_WAIT_87;
+ 
+-    for (uint32_t i = 0; i < PORT_NUM; i++) {
+-        espi_lpc_add_ioport(dev_cfg->parent, (struct peri_ioport *)(&dev_data->ioport[i]));
+-    }
++	for (uint32_t i = 0; i < PORT_NUM; i++) {
++		espi_lpc_add_ioport(cfg->parent, &data->ioport[i]);
++	}
+ 
+-    return 0;
++	LOG_INF("SIO @0x%02x chip-id 0x%04x", cfg->host_sio_reg, cfg->chip_id);
++	return 0;
+ }
+ 
+-#define LS_SIO_INIT(idx)                                      \
+-    static struct sio_ls_data sio_ls_data_##idx = {           \
+-        .ioport = {                                           \
+-            [0] = {                                           \
+-                .content = &(struct peri_ioport_content){     \
+-                    .io_read = io_2e_read,                    \
+-                    .io_write = io_2e_write,                  \
+-                    .ctx = (void *)DEVICE_DT_INST_GET(idx),   \
+-                    .addr = DT_INST_PROP(idx, port),          \
+-                },                                            \
+-            },                                                \
+-            [1] = {                                           \
+-                .content = &(struct peri_ioport_content){     \
+-                    .io_read = io_2f_read,                    \
+-                    .io_write = io_2f_write,                  \
+-                    .ctx = (void *)DEVICE_DT_INST_GET(idx),   \
+-                    .addr = DT_INST_PROP(idx, port) + 1,      \
+-                },                                            \
+-            },                                                \
+-        },                                                    \
+-    };                                                        \
+-    static const struct sio_ls_config sio_ls_cfg_##idx = {    \
+-        .parent = DEVICE_DT_GET(DT_INST_PARENT(idx)),         \
+-        .host_sio_reg = DT_INST_PROP(idx, port),              \
+-    };                                                        \
+-    DEVICE_DT_INST_DEFINE(idx,                                \
+-                          &sio_ls_init,                       \
+-                          NULL,                               \
+-                          &sio_ls_data_##idx,                 \
+-                          &sio_ls_cfg_##idx,                  \
+-                          POST_KERNEL,                        \
+-                          CONFIG_KERNEL_INIT_PRIORITY_DEVICE, \
+-                          0);
++#define LS_SIO_INIT(idx)                                               \
++	static struct sio_ls_data sio_ls_data_##idx;                   \
++	static const struct sio_ls_config sio_ls_cfg_##idx = {         \
++		.parent = DEVICE_DT_GET(DT_INST_PARENT(idx)),          \
++		.host_sio_reg = DT_INST_PROP(idx, port),               \
++		.chip_id = DT_INST_PROP_OR(idx, chip_id, 0x2600),      \
++	};                                                             \
++	DEVICE_DT_INST_DEFINE(idx,                                     \
++			      &sio_ls_init,                            \
++			      NULL,                                    \
++			      &sio_ls_data_##idx,                      \
++			      &sio_ls_cfg_##idx,                       \
++			      POST_KERNEL,                             \
++			      CONFIG_KERNEL_INIT_PRIORITY_DEVICE,      \
++			      0);
+ 
+ DT_INST_FOREACH_STATUS_OKAY(LS_SIO_INIT)
+diff --git a/drivers/espi/espi_ls_sio.h b/drivers/espi/espi_ls_sio.h
+new file mode 100644
+index 00000000000..73858180e07
+--- /dev/null
++++ b/drivers/espi/espi_ls_sio.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (c) 2026 LinkedSemi
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef ZEPHYR_DRIVERS_ESPI_ESPI_LS_SIO_H_
++#define ZEPHYR_DRIVERS_ESPI_ESPI_LS_SIO_H_
++
++#include <zephyr/device.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Matches ls_ec_sdk LDN_COUNT (0x00 .. 0x19). */
++#define SIO_LS_LDN_COUNT 0x1Au
++
++struct sio_ls_ldn_info {
++	uint8_t act;
++	uint8_t irq;
++	uint8_t spec1;
++	uint16_t io_base;
++};
++
++typedef void (*sio_ls_ldn_cb_t)(const struct device *uart_dev);
++
++int sio_ls_register_uart(const struct device *sio, uint8_t ldn,
++			 const struct device *uart_dev, sio_ls_ldn_cb_t on_change,
++			 uint16_t default_io, uint8_t default_irq);
++
++int sio_ls_ldn_info(const struct device *sio, uint8_t ldn,
++		    struct sio_ls_ldn_info *info);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZEPHYR_DRIVERS_ESPI_ESPI_LS_SIO_H_ */
+diff --git a/drivers/espi/espi_ls_sio_uart.c b/drivers/espi/espi_ls_sio_uart.c
+new file mode 100644
+index 00000000000..d1489e5760a
+--- /dev/null
++++ b/drivers/espi/espi_ls_sio_uart.c
+@@ -0,0 +1,722 @@
++#define DT_DRV_COMPAT linkedsemi_ls_sio_uart
++
++#include <zephyr/kernel.h>
++#include <zephyr/device.h>
++#include <zephyr/drivers/gpio.h>
++#include <zephyr/drivers/pinctrl.h>
++#include <zephyr/irq.h>
++#include <zephyr/logging/log.h>
++#include <zephyr/sys/util.h>
++#include <espi_lpc_common.h>
++#include "espi_ls_sio.h"
++#include "cpu.h"
++#include "reg_sysc_per.h"
++#include "reg_base_addr.h"
++#include "reg_uart_type.h"
++
++LOG_MODULE_REGISTER(sio_uart, CONFIG_ESPI_LOG_LEVEL);
++
++/* After SIO (CONFIG_KERNEL_INIT_PRIORITY_DEVICE == 50). Must be a single token. */
++#define SIO_UART_INIT_PRIORITY 51
++
++#define UART_IO_REGS 8
++#define LCR_DLAB     BIT(7)
++
++enum divisor_reg_status {
++	STATUS_NO_CHANGE,
++	SET_DLAB,
++	CLR_DLAB,
++};
++
++enum sio_uart_kind {
++	SIO_UART_DW,
++	SIO_UART_LS,
++};
++
++struct sio_uart_reg_cfg {
++	uint8_t ier;
++	uint8_t fcr;
++	uint8_t lcr;
++	uint8_t mcr;
++	uint8_t scr;
++};
++
++struct sio_lsuart_shadow {
++	uint8_t dll;
++	uint8_t dlm;
++	uint8_t ier;
++	uint8_t lcr;
++	uint8_t mcr;
++	uint8_t scr;
++	uint8_t fifo_flag;
++	uint8_t thr_flag;
++};
++
++struct sio_uart_config {
++	const struct device *espi;
++	const struct device *sio;
++	const struct pinctrl_dev_config *pcfg;
++	struct gpio_dt_spec dtr;
++	struct gpio_dt_spec dsr;
++	struct gpio_dt_spec ri;
++	struct gpio_dt_spec dcd;
++	mem_addr_t mmio;
++	uint32_t clock_hz;
++	uint16_t irqn;
++	uint16_t default_io;
++	uint8_t default_irq;
++	uint8_t ldn;
++	enum sio_uart_kind kind;
++	void (*irq_config)(const struct device *dev);
++};
++
++struct sio_uart_data {
++	struct peri_ioport_content content[UART_IO_REGS];
++	struct peri_ioport ioport[UART_IO_REGS];
++	struct sio_uart_reg_cfg regs;
++	struct sio_lsuart_shadow ls;
++	uint16_t mapped_base;
++	uint8_t host_irq;
++	bool mapped;
++};
++
++static void nop4(void)
++{
++	__asm__ volatile("nop");
++	__asm__ volatile("nop");
++	__asm__ volatile("nop");
++	__asm__ volatile("nop");
++}
++
++static bool is_dwuart(mem_addr_t base)
++{
++	return base == DWUART1_BASE_ADDR || base == DWUART2_BASE_ADDR;
++}
++
++static bool is_lsuart(mem_addr_t base)
++{
++	return base == UART1_BASE_ADDR || base == UART2_BASE_ADDR;
++}
++
++static volatile uint32_t *dw_regs(const struct sio_uart_config *cfg)
++{
++	return (volatile uint32_t *)cfg->mmio;
++}
++
++static reg_uart_t *ls_hw(const struct sio_uart_config *cfg)
++{
++	return (reg_uart_t *)cfg->mmio;
++}
++
++static void uart_clock_on(mem_addr_t base)
++{
++	if (base == DWUART1_BASE_ADDR) {
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_CLR_DWUART1_N_MASK;
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_SET_DWUART1_N_MASK;
++		SYSC_PER->PD_PER_CLKG1 = SYSC_PER_CLKG_SET_DWUART1_MASK;
++	} else if (base == DWUART2_BASE_ADDR) {
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_CLR_DWUART2_N_MASK;
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_SET_DWUART2_N_MASK;
++		SYSC_PER->PD_PER_CLKG1 = SYSC_PER_CLKG_SET_DWUART2_MASK;
++	} else if (base == UART1_BASE_ADDR) {
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_CLR_UART1_N_MASK;
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_SET_UART1_N_MASK;
++		SYSC_PER->PD_PER_CLKG1 = SYSC_PER_CLKG_SET_UART1_MASK;
++	} else if (base == UART2_BASE_ADDR) {
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_CLR_UART2_N_MASK;
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_SET_UART2_N_MASK;
++		SYSC_PER->PD_PER_CLKG1 = SYSC_PER_CLKG_SET_UART2_MASK;
++	}
++}
++
++static void dwuart_reset(mem_addr_t base)
++{
++	if (base == DWUART1_BASE_ADDR) {
++		SYSC_PER->PD_PER_CLKG1 = SYSC_PER_CLKG_CLR_DWUART1_MASK;
++		nop4();
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_CLR_DWUART1_N_MASK;
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_SET_DWUART1_N_MASK;
++		nop4();
++		SYSC_PER->PD_PER_CLKG1 = SYSC_PER_CLKG_SET_DWUART1_MASK;
++	} else if (base == DWUART2_BASE_ADDR) {
++		SYSC_PER->PD_PER_CLKG1 = SYSC_PER_CLKG_CLR_DWUART2_MASK;
++		nop4();
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_CLR_DWUART2_N_MASK;
++		SYSC_PER->PD_PER_SRST1 = SYSC_PER_SRST_SET_DWUART2_N_MASK;
++		nop4();
++		SYSC_PER->PD_PER_CLKG1 = SYSC_PER_CLKG_SET_DWUART2_MASK;
++	}
++}
++
++static void irq_state_update(const struct device *dev)
++{
++	const struct sio_uart_config *cfg = dev->config;
++
++	if (irq_is_enabled(cfg->irqn)) {
++		return;
++	}
++	clr_pending_irq(cfg->irqn);
++	if (!get_pending_irq(cfg->irqn)) {
++		irq_enable(cfg->irqn);
++	}
++}
++
++static void sio_uart_isr(const void *arg)
++{
++	const struct device *dev = arg;
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++
++	irq_disable(cfg->irqn);
++	espi_lpc_raise_edge_irq(cfg->espi, data->host_irq);
++}
++
++static uint8_t msr_from_gpio(const struct sio_uart_config *cfg)
++{
++	uint8_t msr = 0;
++
++	if (gpio_is_ready_dt(&cfg->dsr) && gpio_pin_get_dt(&cfg->dsr) > 0) {
++		msr |= BIT(5);
++	}
++	if (gpio_is_ready_dt(&cfg->ri) && gpio_pin_get_dt(&cfg->ri) > 0) {
++		msr |= BIT(6);
++	}
++	if (gpio_is_ready_dt(&cfg->dcd) && gpio_pin_get_dt(&cfg->dcd) > 0) {
++		msr |= BIT(7);
++	}
++	return msr;
++}
++
++static void apply_dtr(const struct sio_uart_config *cfg, uint8_t mcr)
++{
++	if (gpio_is_ready_dt(&cfg->dtr)) {
++		gpio_pin_set_dt(&cfg->dtr, (mcr & BIT(0)) ? 1 : 0);
++	}
++}
++
++static void spec_mul_div(uint8_t spec1, uint8_t *mul, uint8_t *div)
++{
++	switch ((spec1 & 0x06) >> 1) {
++	case 1:
++		*mul = 12;
++		*div = 1;
++		break;
++	case 2:
++		*mul = 1;
++		*div = 1;
++		break;
++	case 3:
++		*mul = 13;
++		*div = 8;
++		break;
++	default:
++		*mul = 13;
++		*div = 1;
++		break;
++	}
++}
++
++static uint16_t host_div_to_hw(uint32_t clock_hz, uint16_t host_div, uint8_t spec1)
++{
++	uint8_t mul, div;
++	uint32_t clk_mhz = clock_hz / 1000000u;
++	uint32_t hw;
++
++	spec_mul_div(spec1, &mul, &div);
++	if (host_div == 0 || div == 0 || clk_mhz == 0) {
++		return 1;
++	}
++	hw = clk_mhz * host_div * mul / (24u * div);
++	if (hw == 0) {
++		hw = 1;
++	}
++	if (hw > 0xffffu) {
++		hw = 0xffffu;
++	}
++	return (uint16_t)hw;
++}
++
++static uint8_t ldn_spec1(const struct sio_uart_config *cfg)
++{
++	struct sio_ls_ldn_info info;
++
++	if (sio_ls_ldn_info(cfg->sio, cfg->ldn, &info) == 0) {
++		return info.spec1;
++	}
++	return 0;
++}
++
++static enum divisor_reg_status dlab_status(uint8_t cur_lcr, uint8_t val, uint8_t offset)
++{
++	if (offset != 0x03) {
++		return STATUS_NO_CHANGE;
++	}
++	if ((cur_lcr & LCR_DLAB) && ((val & LCR_DLAB) == 0)) {
++		return CLR_DLAB;
++	}
++	if (((cur_lcr & LCR_DLAB) == 0) && (val & LCR_DLAB)) {
++		return SET_DLAB;
++	}
++	return STATUS_NO_CHANGE;
++}
++
++static void sio_uart_unmap(const struct device *dev)
++{
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++
++	if (!data->mapped) {
++		return;
++	}
++	for (int i = 0; i < UART_IO_REGS; i++) {
++		espi_lpc_remove_ioport(cfg->espi, &data->ioport[i]);
++	}
++	data->mapped = false;
++}
++
++static void sio_uart_on_ldn_change(const struct device *dev)
++{
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++	struct sio_ls_ldn_info info;
++
++	if (sio_ls_ldn_info(cfg->sio, cfg->ldn, &info) != 0) {
++		return;
++	}
++
++	data->host_irq = info.irq;
++
++	if ((info.act & BIT(0)) == 0) {
++		sio_uart_unmap(dev);
++		irq_disable(cfg->irqn);
++		return;
++	}
++
++	if (data->mapped) {
++		if (data->mapped_base != info.io_base) {
++			for (int i = 0; i < UART_IO_REGS; i++) {
++				data->content[i].addr = info.io_base + i;
++			}
++			data->mapped_base = info.io_base;
++		}
++		return;
++	}
++
++	for (int i = 0; i < UART_IO_REGS; i++) {
++		data->content[i].addr = info.io_base + i;
++		data->ioport[i].content = &data->content[i];
++		espi_lpc_add_ioport(cfg->espi, &data->ioport[i]);
++	}
++	data->mapped_base = info.io_base;
++	data->mapped = true;
++	irq_state_update(dev);
++}
++
++static void dwuart_io_read(const struct peri_ioport_content *ioport, uint8_t size, void *res)
++{
++	struct device *dev = ioport->ctx;
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++	volatile uint32_t *regs = dw_regs(cfg);
++	uint8_t off = (uint8_t)(ioport - data->content);
++	uint8_t *val = res;
++
++	ARG_UNUSED(size);
++	if (off > 7) {
++		*val = 0;
++		return;
++	}
++	if (off == 6) {
++		*val = (uint8_t)((regs[off] & 0x1f) | msr_from_gpio(cfg));
++	} else {
++		*val = (uint8_t)regs[off];
++	}
++	irq_state_update(dev);
++}
++
++static void dwuart_io_write(const struct peri_ioport_content *ioport, uint8_t size, uint8_t *wdata)
++{
++	struct device *dev = ioport->ctx;
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++	volatile uint32_t *regs = dw_regs(cfg);
++	uint8_t off = (uint8_t)(ioport - data->content);
++	uint8_t val = *wdata;
++	enum divisor_reg_status st;
++
++	ARG_UNUSED(size);
++	if (off > 7) {
++		return;
++	}
++
++	st = dlab_status((uint8_t)regs[3], val, off);
++	if (st == SET_DLAB) {
++		dwuart_reset(cfg->mmio);
++		regs[1] = data->regs.ier;
++		regs[2] = data->regs.fcr;
++		regs[3] = data->regs.lcr;
++		regs[4] = data->regs.mcr;
++		regs[7] = data->regs.scr;
++	} else if (st == CLR_DLAB) {
++		uint16_t host_div = (uint16_t)((regs[1] << 8) | (regs[0] & 0xff));
++		uint16_t hw = host_div_to_hw(cfg->clock_hz, host_div, ldn_spec1(cfg));
++
++		regs[0] = hw & 0xff;
++		regs[1] = hw >> 8;
++	}
++
++	switch (off) {
++	case 1:
++		if ((regs[3] & LCR_DLAB) == 0) {
++			data->regs.ier = val;
++		}
++		break;
++	case 2:
++		data->regs.fcr = val;
++		break;
++	case 3:
++		data->regs.lcr = val;
++		break;
++	case 4:
++		data->regs.mcr = val;
++		apply_dtr(cfg, val);
++		break;
++	case 7:
++		data->regs.scr = val;
++		break;
++	default:
++		break;
++	}
++
++	regs[off] = val;
++	irq_state_update(dev);
++}
++
++static uint8_t lsuart_iir(reg_uart_t *hw, struct sio_lsuart_shadow *ls)
++{
++	uint32_t ifm = hw->IFM;
++	uint8_t val;
++
++	if (ifm & BIT(2)) {
++		val = 0x06;
++	} else if (ifm & BIT(0)) {
++		val = 0x04;
++	} else if (ifm & BIT(4)) {
++		val = 0x0c;
++	} else if (ls->thr_flag || (ifm & BIT(1))) {
++		ls->thr_flag = 0;
++		hw->ICR = BIT(1);
++		val = 0x02;
++	} else if (ifm & BIT(3)) {
++		val = 0;
++	} else if (ifm & BIT(5)) {
++		val = 0x07;
++	} else {
++		val = 0x01;
++	}
++	if (ls->fifo_flag) {
++		val |= 0xc0;
++	}
++	return val;
++}
++
++static void lsuart_apply_baud(const struct device *dev)
++{
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++	reg_uart_t *hw = ls_hw(cfg);
++	uint16_t host_div = ((uint16_t)data->ls.dlm << 8) | data->ls.dll;
++	uint16_t hw_div = host_div_to_hw(cfg->clock_hz, host_div, ldn_spec1(cfg));
++
++	hw->LCR &= ~BIT(5);
++	hw->BRR = ((uint32_t)hw_div) << 4;
++	nop4();
++	hw->LCR |= BIT(5);
++}
++
++static void lsuart_io_read(const struct peri_ioport_content *ioport, uint8_t size, void *res)
++{
++	struct device *dev = ioport->ctx;
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++	reg_uart_t *hw = ls_hw(cfg);
++	uint8_t off = (uint8_t)(ioport - data->content);
++	uint8_t *val = res;
++	uint32_t ifm;
++
++	ARG_UNUSED(size);
++	*val = 0;
++	if (off > 7) {
++		return;
++	}
++
++	switch (off) {
++	case 0:
++		if ((data->ls.lcr & LCR_DLAB) == 0) {
++			*val = (uint8_t)hw->RBR;
++			ifm = hw->IFM;
++			if (ifm & BIT(0)) {
++				hw->ICR = BIT(0);
++			}
++			if (ifm & BIT(4)) {
++				hw->ICR = BIT(4);
++			}
++		} else {
++			*val = (uint8_t)((hw->BRR >> 4) & 0xff);
++		}
++		break;
++	case 1:
++		if ((data->ls.lcr & LCR_DLAB) == 0) {
++			*val = (uint8_t)(hw->IVS & 0x0f);
++		} else {
++			*val = (uint8_t)(hw->BRR >> 12);
++		}
++		break;
++	case 2:
++		*val = lsuart_iir(hw, &data->ls);
++		break;
++	case 3:
++		*val = (uint8_t)(hw->LCR & 0xdf);
++		break;
++	case 4:
++		*val = data->ls.mcr;
++		break;
++	case 5:
++		*val = (uint8_t)hw->SR;
++		if (hw->IFM & BIT(2)) {
++			hw->ICR = BIT(2);
++		}
++		break;
++	case 6:
++		*val = msr_from_gpio(cfg);
++		if (hw->SR & BIT(14)) {
++			*val |= BIT(4);
++		}
++		if (hw->SR & BIT(13)) {
++			*val |= BIT(0);
++		}
++		if (hw->IFM & BIT(3)) {
++			hw->ICR = BIT(3);
++		}
++		break;
++	case 7:
++		*val = data->ls.scr;
++		break;
++	default:
++		break;
++	}
++	irq_state_update(dev);
++}
++
++static void lsuart_io_write(const struct peri_ioport_content *ioport, uint8_t size, uint8_t *wdata)
++{
++	struct device *dev = ioport->ctx;
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++	reg_uart_t *hw = ls_hw(cfg);
++	uint8_t off = (uint8_t)(ioport - data->content);
++	uint8_t val = *wdata;
++	uint8_t bit67;
++
++	ARG_UNUSED(size);
++	if (off > 7) {
++		return;
++	}
++
++	if (dlab_status(data->ls.lcr, val, off) == CLR_DLAB) {
++		lsuart_apply_baud(dev);
++	}
++
++	switch (off) {
++	case 0:
++		if ((data->ls.lcr & LCR_DLAB) == 0) {
++			hw->TBR = val;
++			if (hw->IFM & BIT(1)) {
++				hw->ICR = BIT(1);
++			}
++		} else {
++			data->ls.dll = val;
++		}
++		break;
++	case 1:
++		if (data->ls.lcr & LCR_DLAB) {
++			data->ls.dlm = val;
++		} else {
++			data->ls.ier = val;
++			for (int i = 0; i <= 3; i++) {
++				if (val & BIT(i)) {
++					hw->IER = BIT(i);
++					if (i == 1) {
++						espi_lpc_raise_edge_irq(cfg->espi, data->host_irq);
++						data->ls.thr_flag = 1;
++					}
++				} else {
++					hw->IDR = BIT(i);
++				}
++			}
++		}
++		break;
++	case 2:
++		bit67 = (val & 0x30) << 2;
++		val &= 0x0f;
++		hw->FCR = val | bit67 | ((data->ls.fifo_flag ^ (val & 0x01)) ? 6 : 0);
++		data->ls.fifo_flag = val & 0x01;
++		break;
++	case 3:
++		hw->LCR &= ~BIT(5);
++		data->ls.lcr = val;
++		hw->LCR = (val & (uint8_t)~BIT(6)) | BIT(5);
++		hw->IER |= 0x10;
++		hw->LCR |= BIT(8);
++		hw->RTOR = 0x04;
++		break;
++	case 4:
++		data->ls.mcr = val;
++		if (val & BIT(5)) {
++			hw->MCR |= BIT(2);
++		} else {
++			hw->MCR &= ~BIT(2);
++		}
++		if (val & BIT(1)) {
++			hw->MCR |= BIT(3);
++		} else {
++			hw->MCR &= ~BIT(3);
++		}
++		apply_dtr(cfg, val);
++		break;
++	case 7:
++		data->ls.scr = val;
++		break;
++	default:
++		break;
++	}
++	irq_state_update(dev);
++}
++
++static int modem_gpio_init(const struct sio_uart_config *cfg)
++{
++	int ret;
++
++	if (gpio_is_ready_dt(&cfg->dtr)) {
++		ret = gpio_pin_configure_dt(&cfg->dtr, GPIO_OUTPUT_INACTIVE);
++		if (ret) {
++			return ret;
++		}
++	}
++	if (gpio_is_ready_dt(&cfg->dsr)) {
++		ret = gpio_pin_configure_dt(&cfg->dsr, GPIO_INPUT);
++		if (ret) {
++			return ret;
++		}
++	}
++	if (gpio_is_ready_dt(&cfg->ri)) {
++		ret = gpio_pin_configure_dt(&cfg->ri, GPIO_INPUT);
++		if (ret) {
++			return ret;
++		}
++	}
++	if (gpio_is_ready_dt(&cfg->dcd)) {
++		ret = gpio_pin_configure_dt(&cfg->dcd, GPIO_INPUT);
++		if (ret) {
++			return ret;
++		}
++	}
++	return 0;
++}
++
++static int sio_uart_init(const struct device *dev)
++{
++	const struct sio_uart_config *cfg = dev->config;
++	struct sio_uart_data *data = dev->data;
++	int ret;
++
++	if (!device_is_ready(cfg->espi) || !device_is_ready(cfg->sio)) {
++		LOG_ERR("parent eSPI/SIO not ready");
++		return -ENODEV;
++	}
++	if (!is_dwuart(cfg->mmio) && !is_lsuart(cfg->mmio)) {
++		LOG_ERR("unsupported UART MMIO 0x%08lx", (unsigned long)cfg->mmio);
++		return -ENODEV;
++	}
++
++	for (int i = 0; i < UART_IO_REGS; i++) {
++		if (cfg->kind == SIO_UART_LS) {
++			data->content[i].io_read = lsuart_io_read;
++			data->content[i].io_write = lsuart_io_write;
++		} else {
++			data->content[i].io_read = dwuart_io_read;
++			data->content[i].io_write = dwuart_io_write;
++		}
++		data->content[i].ctx = (struct device *)dev;
++	}
++
++	uart_clock_on(cfg->mmio);
++
++	ret = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_DEFAULT);
++	if (ret < 0) {
++		LOG_ERR("pinctrl failed (%d)", ret);
++		return ret;
++	}
++
++	ret = modem_gpio_init(cfg);
++	if (ret) {
++		LOG_ERR("modem gpio init failed (%d)", ret);
++		return ret;
++	}
++
++	data->host_irq = cfg->default_irq;
++	cfg->irq_config(dev);
++
++	ret = sio_ls_register_uart(cfg->sio, cfg->ldn, dev, sio_uart_on_ldn_change,
++				   cfg->default_io, cfg->default_irq);
++	if (ret) {
++		return ret;
++	}
++
++	LOG_INF("COM LDN 0x%02x %s@0x%08lx default IO 0x%03x IRQ %u",
++		cfg->ldn, cfg->kind == SIO_UART_LS ? "LSUART" : "DWUART",
++		(unsigned long)cfg->mmio, cfg->default_io, cfg->default_irq);
++	return 0;
++}
++
++#define SIO_UART_KIND(idx)                                                             \
++	((DT_REG_ADDR(DT_INST_PHANDLE(idx, uart)) == UART1_BASE_ADDR ||                \
++	  DT_REG_ADDR(DT_INST_PHANDLE(idx, uart)) == UART2_BASE_ADDR) ?                 \
++		 SIO_UART_LS : SIO_UART_DW)
++
++#define SIO_UART_IRQ_CFG(idx)                                                          \
++	static void sio_uart_irq_config_##idx(const struct device *dev)                \
++	{                                                                              \
++		ARG_UNUSED(dev);                                                       \
++		IRQ_CONNECT(DT_IRQN(DT_INST_PHANDLE(idx, uart)),                       \
++			    DT_IRQ(DT_INST_PHANDLE(idx, uart), priority),              \
++			    sio_uart_isr, DEVICE_DT_INST_GET(idx), 0);                 \
++		irq_enable(DT_IRQN(DT_INST_PHANDLE(idx, uart)));                       \
++	}
++
++#define SIO_UART_INIT(idx)                                                             \
++	PINCTRL_DT_INST_DEFINE(idx);                                                   \
++	SIO_UART_IRQ_CFG(idx);                                                         \
++	static struct sio_uart_data sio_uart_data_##idx;                               \
++	static const struct sio_uart_config sio_uart_cfg_##idx = {                     \
++		.espi = DEVICE_DT_GET(DT_PARENT(DT_INST_PARENT(idx))),                 \
++		.sio = DEVICE_DT_GET(DT_INST_PARENT(idx)),                             \
++		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),                           \
++		.dtr = GPIO_DT_SPEC_INST_GET_OR(idx, dtr_gpios, {0}),                  \
++		.dsr = GPIO_DT_SPEC_INST_GET_OR(idx, dsr_gpios, {0}),                  \
++		.ri = GPIO_DT_SPEC_INST_GET_OR(idx, ri_gpios, {0}),                    \
++		.dcd = GPIO_DT_SPEC_INST_GET_OR(idx, dcd_gpios, {0}),                  \
++		.mmio = DT_REG_ADDR(DT_INST_PHANDLE(idx, uart)),                       \
++		.clock_hz = DT_PROP(DT_INST_PHANDLE(idx, uart), clock_frequency),       \
++		.irqn = DT_IRQN(DT_INST_PHANDLE(idx, uart)),                           \
++		.default_io = DT_INST_PROP(idx, default_io),                           \
++		.default_irq = DT_INST_PROP(idx, default_irq),                         \
++		.ldn = DT_INST_PROP(idx, ldn),                                         \
++		.kind = SIO_UART_KIND(idx),                                            \
++		.irq_config = sio_uart_irq_config_##idx,                               \
++	};                                                                             \
++	DEVICE_DT_INST_DEFINE(idx, &sio_uart_init, NULL, &sio_uart_data_##idx,         \
++			      &sio_uart_cfg_##idx, POST_KERNEL,                        \
++			      SIO_UART_INIT_PRIORITY, 0);
++
++DT_INST_FOREACH_STATUS_OKAY(SIO_UART_INIT)
+diff --git a/dts/bindings/espi/linkedsemi,ls-sio-uart.yaml b/dts/bindings/espi/linkedsemi,ls-sio-uart.yaml
+new file mode 100644
+index 00000000000..aa7945936ca
+--- /dev/null
++++ b/dts/bindings/espi/linkedsemi,ls-sio-uart.yaml
+@@ -0,0 +1,49 @@
++description: |
++  Linkedsemi Super I/O UART logical device (host COM via eSPI I/O).
++
++  Child of linkedsemi,ls-sio. Host 16550 windows are mapped at runtime from
++  LDN 0x60/0x61; do not enable the referenced SoC UART as a Zephyr console.
++
++compatible: "linkedsemi,ls-sio-uart"
++
++include: [base.yaml, pinctrl-device.yaml]
++
++properties:
++  ldn:
++    type: int
++    required: true
++    description: ITE logical device number (COM1=0x01, COM2=0x02, COM3=0x08, COM4=0x09).
++
++  uart:
++    type: phandle
++    required: true
++    description: |
++      SoC UART MMIO node. COM1/2 use DWUART1/DWUART2; COM3/4 use UART1/UART2
++      (LSUART, 16550 translated in the SIO driver). Keep that node status
++      disabled so Zephyr serial does not claim it.
++
++  default-io:
++    type: int
++    required: true
++    description: Power-on host I/O base (COM1 typically 0x3f8).
++
++  default-irq:
++    type: int
++    required: true
++    description: Power-on host IRQ (COM1 typically 4).
++
++  dtr-gpios:
++    type: phandle-array
++    description: DTR output (active low).
++
++  dsr-gpios:
++    type: phandle-array
++    description: DSR input (active low).
++
++  ri-gpios:
++    type: phandle-array
++    description: RI input (active low).
++
++  dcd-gpios:
++    type: phandle-array
++    description: DCD input (active low).
+diff --git a/dts/bindings/espi/linkedsemi,ls-sio.yaml b/dts/bindings/espi/linkedsemi,ls-sio.yaml
+index aef019fffd5..b344facba21 100644
+--- a/dts/bindings/espi/linkedsemi,ls-sio.yaml
++++ b/dts/bindings/espi/linkedsemi,ls-sio.yaml
+@@ -1,4 +1,4 @@
+-description: Linkedsemi eSPI slave to sio
++description: Linkedsemi eSPI slave Super I/O (PnP config 0x2E/0x2F)
+ 
+ compatible: "linkedsemi,ls-sio"
+ 
+@@ -8,3 +8,12 @@ properties:
+   port:
+     type: int
+     required: true
++    description: Host I/O index port (data port is port+1). Typically 0x2e.
++
++  chip-id:
++    type: int
++    default: 0x2600
++    description: |
++      16-bit Super I/O chip ID returned at config index 0x20 (MSB) and 0x21 (LSB).
++      Default 0x2600 preserves the legacy 0x20==0x26 probe byte.
++      EHL host BIOS expects ITE IT8786, i.e. 0x8786.
+diff --git a/dts/riscv/linkedsemi/ls101x.dtsi b/dts/riscv/linkedsemi/ls101x.dtsi
+index 72ccf9d5fc2..f04d43e7ee5 100644
+--- a/dts/riscv/linkedsemi/ls101x.dtsi
++++ b/dts/riscv/linkedsemi/ls101x.dtsi
+@@ -219,14 +219,15 @@
+             reg = <0x40004000 0x400>;
+             status = "disabled";
+             interrupts = <27 3>;
+-            clocks = <&cpu_cctl LS_CCTL_CLKG0 LS_CLKG_SET_ESPI_POS LS_CLKG_CLR_ESPI_POS>;
++            /* PD_CPU_CLKG @ SYSC_CPU+0x10 — must use LS_CCTL_CLKG, not CLKG0(0x0/CPU_SYSC) */
++            clocks = <&cpu_cctl LS_CCTL_CLKG LS_CLKG_SET_ESPI_POS LS_CLKG_CLR_ESPI_POS>;
+         };
+         lpc: lpc@40005000 {
+             compatible = "linkedsemi,ls-lpc";
+             reg = <0x40005000 0x400>;
+             status = "disabled";
+             interrupts = <28 3>;
+-            clocks = <&cpu_cctl LS_CCTL_CLKG0 LS_CLKG_SET_LPC_POS LS_CLKG_CLR_LPC_POS>;
++            clocks = <&cpu_cctl LS_CCTL_CLKG LS_CLKG_SET_LPC_POS LS_CLKG_CLR_LPC_POS>;
+         };
+ 		spi1: spi@40087000 {
+ 			compatible = "snps,designware-spi";
+diff --git a/include/zephyr/dt-bindings/pinctrl/ls101x-pinctrl.h b/include/zephyr/dt-bindings/pinctrl/ls101x-pinctrl.h
+index 38b11eb1ffb..df41f72c29f 100644
+--- a/include/zephyr/dt-bindings/pinctrl/ls101x-pinctrl.h
++++ b/include/zephyr/dt-bindings/pinctrl/ls101x-pinctrl.h
+@@ -240,15 +240,21 @@
+ /* UART 2 */
+ #define UART2_TXD    FIO_UART2_TXD
+ #define UART2_RXD    FIO_UART2_RXD
++#define UART2_CTSN   FIO_UART2_CTSN
++#define UART2_RTSN   FIO_UART2_RTSN
+ /* UART 3 */
+ #define UART3_TXD    FIO_UART3_TXD
+ #define UART3_RXD    FIO_UART3_RXD
+ /* UART 4 */
+ #define DWUART1_TXD    FIO_DWUART1_TXD
+ #define DWUART1_RXD    FIO_DWUART1_RXD
++#define DWUART1_CTSN   FIO_DWUART1_CTSN
++#define DWUART1_RTSN   FIO_DWUART1_RTSN
+ /* UART 5 */
+ #define DWUART2_TXD    FIO_DWUART2_TXD
+ #define DWUART2_RXD    FIO_DWUART2_RXD
++#define DWUART2_CTSN   FIO_DWUART2_CTSN
++#define DWUART2_RTSN   FIO_DWUART2_RTSN
+ /* SPI 1 */
+ #define SPI1_NSS0    FIO_SPI1_NSS0
+ #define SPI1_NSS1    FIO_SPI1_NSS1
+diff --git a/include/zephyr/posix/posix_types.h b/include/zephyr/posix/posix_types.h
+index ca8023be831..116f7a23054 100644
+--- a/include/zephyr/posix/posix_types.h
++++ b/include/zephyr/posix/posix_types.h
+@@ -102,16 +102,18 @@ struct pthread_attr {
+ #if !defined(CONFIG_NEWLIB_LIBC)
+ typedef struct pthread_attr pthread_attr_t;
+ BUILD_ASSERT(sizeof(pthread_attr_t) >= sizeof(struct pthread_attr));
+-#endif
+ 
+ typedef uint32_t pthread_t;
+ typedef uint32_t pthread_spinlock_t;
++#endif
+ 
+ /* Semaphore */
+ typedef struct k_sem sem_t;
+ 
+ /* Mutex */
++#if !defined(CONFIG_NEWLIB_LIBC)
+ typedef uint32_t pthread_mutex_t;
++#endif
+ 
+ struct pthread_mutexattr {
+ 	unsigned char type: 2;
+@@ -123,7 +125,9 @@ BUILD_ASSERT(sizeof(pthread_mutexattr_t) >= sizeof(struct pthread_mutexattr));
+ #endif
+ 
+ /* Condition variables */
++#if !defined(CONFIG_NEWLIB_LIBC)
+ typedef uint32_t pthread_cond_t;
++#endif
+ 
+ struct pthread_condattr {
+ 	clockid_t clock;
+@@ -135,7 +139,9 @@ BUILD_ASSERT(sizeof(pthread_condattr_t) >= sizeof(struct pthread_condattr));
+ #endif
+ 
+ /* Barrier */
++#if !defined(CONFIG_NEWLIB_LIBC)
+ typedef uint32_t pthread_barrier_t;
++#endif
+ 
+ typedef struct pthread_barrierattr {
+ 	int pshared;
+diff --git a/soc/linkedsemi/Kconfig b/soc/linkedsemi/Kconfig
+index 4b0e9200630..53fa6405936 100644
+--- a/soc/linkedsemi/Kconfig
++++ b/soc/linkedsemi/Kconfig
+@@ -2,7 +2,7 @@
+ if SOC_FAMILY_LS_MCU
+ 
+ config ESPI_LPC
+-    bool
++    bool "Linkedsemi eSPI/LPC common support"
+     default y
+ 
+ config ESPI_LPC_MBOX
+diff --git a/soc/linkedsemi/common/e906/soc_isr_stacking_e906.c b/soc/linkedsemi/common/e906/soc_isr_stacking_e906.c
+index 5a4b7ebf69f..2b4ee6ec9cb 100644
+--- a/soc/linkedsemi/common/e906/soc_isr_stacking_e906.c
++++ b/soc/linkedsemi/common/e906/soc_isr_stacking_e906.c
+@@ -4,7 +4,6 @@
+ #include <zephyr/init.h>
+ #include <zephyr/kernel.h>
+ #include <zephyr/device.h>
+-#include <zephyr/drivers/flash.h>
+ #include <zephyr/arch/riscv/csr.h>
+ #include "soc.h"
+ #include "smp/lsqsh_smp.h"
+@@ -12,31 +11,64 @@
+ 
+ uint32_t irq_nested_level[CONFIG_MP_MAX_NUM_CPUS];
+ static uint32_t irq_nested_mcause[CONFIG_MP_MAX_NUM_CPUS][IRQ_NESTED_MAX];
++
++#if defined(CONFIG_FLASH)
++#include <zephyr/drivers/flash.h>
++
+ static struct device zephyr_flash_controller_ram_struct;
+-const struct device *const zephyr_flash_controller = DEVICE_DT_GET_OR_NULL(DT_CHOSEN(zephyr_flash_controller));
++const struct device *const zephyr_flash_controller =
++	DEVICE_DT_GET_OR_NULL(DT_CHOSEN(zephyr_flash_controller));
+ 
+-int zephyr_flash_controller_ram_struct_init()
++extern int flash_ls_ex_op(const struct device *dev, uint16_t code,
++			  const uintptr_t in, void *out);
++
++static int zephyr_flash_controller_ram_struct_init(void)
++{
++	if (zephyr_flash_controller == NULL) {
++		return -ENODEV;
++	}
++	zephyr_flash_controller_ram_struct = *zephyr_flash_controller;
++	return 0;
++}
++SYS_INIT(zephyr_flash_controller_ram_struct_init, PRE_KERNEL_1,
++	 CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
++
++static inline void flash_suspend_for_isr(uint32_t cpu_id)
++{
++	flash_ls_ex_op(&zephyr_flash_controller_ram_struct,
++		       FLASH_DRIVER_SUSPEND_OPCODE, cpu_id, NULL);
++}
++
++static inline void flash_resume_for_isr(uint32_t cpu_id)
++{
++	flash_ls_ex_op(&zephyr_flash_controller_ram_struct,
++		       FLASH_DRIVER_RESUME_OPCODE, cpu_id, NULL);
++}
++#else
++static inline void flash_suspend_for_isr(uint32_t cpu_id)
+ {
+-    zephyr_flash_controller_ram_struct = *zephyr_flash_controller;
+-    return 0;
++	ARG_UNUSED(cpu_id);
+ }
+-SYS_INIT(zephyr_flash_controller_ram_struct_init, PRE_KERNEL_1, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
+ 
+-extern int flash_ls_ex_op(const struct device *dev, uint16_t code, const uintptr_t in, void *out);
++static inline void flash_resume_for_isr(uint32_t cpu_id)
++{
++	ARG_UNUSED(cpu_id);
++}
++#endif
+ 
+ __ramfunc void isr_stacking_mcause(void)
+ {
+ 	uint32_t _cpu_id = get_cur_cpu_id();
+-    flash_ls_ex_op(&zephyr_flash_controller_ram_struct,FLASH_DRIVER_SUSPEND_OPCODE,_cpu_id,NULL);
+-    if(irq_nested_level[_cpu_id] < IRQ_NESTED_MAX)
+-    {
+-        irq_nested_mcause[_cpu_id][irq_nested_level[_cpu_id]] = csr_read(mcause);
+-        irq_nested_level[_cpu_id]++;
+-    }
+-    else
+-    {
+-        while(1);
+-    }
++
++	flash_suspend_for_isr(_cpu_id);
++	if (irq_nested_level[_cpu_id] < IRQ_NESTED_MAX) {
++		irq_nested_mcause[_cpu_id][irq_nested_level[_cpu_id]] =
++			csr_read(mcause);
++		irq_nested_level[_cpu_id]++;
++	} else {
++		while (1) {
++		}
++	}
+ }
+ 
+ #define MCAUSE_MPP_MASK (3UL << 28)
+@@ -44,26 +76,27 @@ __ramfunc void isr_stacking_mcause(void)
+ 
+ __ramfunc void isr_unstacking_mcause(void)
+ {
+-    uint32_t current_mcause;
+-    uint32_t restore_mcause;
+-	/* get current cpu number */
++	uint32_t current_mcause;
++	uint32_t restore_mcause;
+ 	uint32_t _cpu_id = get_cur_cpu_id();
+-    if(irq_nested_level[_cpu_id] > 0 && irq_nested_level[_cpu_id] <= IRQ_NESTED_MAX)
+-    {
+-        irq_nested_level[_cpu_id]--;
+-        restore_mcause = irq_nested_mcause[_cpu_id][irq_nested_level[_cpu_id]];
+-        current_mcause = csr_read(mcause);
+-
+-        current_mcause &=  (MCAUSE_MPP_MASK | MCAUSE_MPIE_MASK);
+-        MODIFY_REG(restore_mcause,(MCAUSE_MPP_MASK | MCAUSE_MPIE_MASK),current_mcause);
+-
+-        csr_write(mcause,restore_mcause);
+-    }
+-    else
+-    {
+-        while(1);
+-    }
+-    flash_ls_ex_op(&zephyr_flash_controller_ram_struct,FLASH_DRIVER_RESUME_OPCODE,_cpu_id,NULL);
++
++	if (irq_nested_level[_cpu_id] > 0 &&
++	    irq_nested_level[_cpu_id] <= IRQ_NESTED_MAX) {
++		irq_nested_level[_cpu_id]--;
++		restore_mcause =
++			irq_nested_mcause[_cpu_id][irq_nested_level[_cpu_id]];
++		current_mcause = csr_read(mcause);
++
++		current_mcause &= (MCAUSE_MPP_MASK | MCAUSE_MPIE_MASK);
++		MODIFY_REG(restore_mcause, (MCAUSE_MPP_MASK | MCAUSE_MPIE_MASK),
++			   current_mcause);
++
++		csr_write(mcause, restore_mcause);
++	} else {
++		while (1) {
++		}
++	}
++	flash_resume_for_isr(_cpu_id);
+ }
+ 
+ #if defined(CONFIG_RISCV_SOC_HAS_CUSTOM_IRQ_HANDLING)
+@@ -71,41 +104,45 @@ __ramfunc void isr_unstacking_mcause(void)
+ #include <zephyr/tracing/tracing.h>
+ #include <ctf_top.h>
+ #else
+-static inline void ctf_top_isr_enter_id(uint8_t cpu, uint8_t id) {}
+-static inline void ctf_top_isr_exit_id(uint8_t cpu) {}
++static inline void ctf_top_isr_enter_id(uint8_t cpu, uint8_t id)
++{
++	ARG_UNUSED(cpu);
++	ARG_UNUSED(id);
++}
++static inline void ctf_top_isr_exit_id(uint8_t cpu)
++{
++	ARG_UNUSED(cpu);
++}
+ #endif
+ static inline uint32_t mnxti_get_no_set_mie(void)
+ {
+-    uint32_t mnxti;
++	uint32_t mnxti;
+ 
+-    __asm__ volatile (
+-        "csrrsi %0, mnxti, 1"
+-        : "=r"(mnxti)
+-        :
+-        : "memory"
+-    );
++	__asm__ volatile("csrrsi %0, mnxti, 1" : "=r"(mnxti) : : "memory");
+ 
+-    return mnxti;
++	return mnxti;
+ }
+ 
+ void __soc_handle_all_irqs(void)
+ {
+ 	while (1) {
+-        uint32_t mnxti = mnxti_get_no_set_mie();
+-        uint32_t irq_num = mnxti >> 2;
+-        struct _isr_table_entry *entry;
+-        uint32_t _cpu_id = get_cur_cpu_id();
+-        if (0 == mnxti) {
+-            break;
+-        }
+-        entry = &_sw_isr_table[irq_num];
+-        ctf_top_isr_enter_id(_cpu_id, irq_num);
+-        __enable_irq();
+-        (entry->isr)(entry->arg);
+-        __disable_irq();
+-        ctf_top_isr_exit_id(_cpu_id);
+-        csr_write(mcause,irq_nested_mcause[_cpu_id][irq_nested_level[_cpu_id]-1]);
+-    }
++		uint32_t mnxti = mnxti_get_no_set_mie();
++		uint32_t irq_num = mnxti >> 2;
++		struct _isr_table_entry *entry;
++		uint32_t _cpu_id = get_cur_cpu_id();
++
++		if (0 == mnxti) {
++			break;
++		}
++		entry = &_sw_isr_table[irq_num];
++		ctf_top_isr_enter_id(_cpu_id, irq_num);
++		__enable_irq();
++		(entry->isr)(entry->arg);
++		__disable_irq();
++		ctf_top_isr_exit_id(_cpu_id);
++		csr_write(mcause,
++			  irq_nested_mcause[_cpu_id][irq_nested_level[_cpu_id] - 1]);
++	}
+ }
+ 
+ #endif
+diff --git a/soc/linkedsemi/common/espi_lpc/CMakeLists.txt b/soc/linkedsemi/common/espi_lpc/CMakeLists.txt
+index 3c0f55337de..852088fc032 100644
+--- a/soc/linkedsemi/common/espi_lpc/CMakeLists.txt
++++ b/soc/linkedsemi/common/espi_lpc/CMakeLists.txt
+@@ -1,4 +1,7 @@
+ zephyr_include_directories(.)
+-zephyr_sources_ifdef(CONFIG_ESPI_LPC espi_lpc_common.c)
++# Common helpers are required by espi_ls.c even when CONFIG_ESPI_LPC is off.
++if(CONFIG_ESPI_LPC OR CONFIG_ESPI_LS)
++  zephyr_sources(espi_lpc_common.c)
++endif()
+ zephyr_library_sources_ifdef(CONFIG_ESPI_LPC_HOST_VUART  espi_lpc_host_vuart.c)
+ zephyr_library_sources_ifdef(CONFIG_ESPI_LPC_HOST_KCS    espi_lpc_host_kcs.c)
+diff --git a/soc/linkedsemi/common/espi_lpc/espi_lpc_common.h b/soc/linkedsemi/common/espi_lpc/espi_lpc_common.h
+index 0e5ce1331f1..adbad3e8f20 100644
+--- a/soc/linkedsemi/common/espi_lpc/espi_lpc_common.h
++++ b/soc/linkedsemi/common/espi_lpc/espi_lpc_common.h
+@@ -19,9 +19,15 @@
+     #include <soc_clock.h>
+ #endif
+ 
+-#define ESPI_SYS_EVT_2_SLP_S5_N	BIT(2)
++/*
++ * Leo DN_VWIR_S02 nibble (board-proven vs PE15 / LA):
++ *   bit0 = SLP_S5#, bit1 = SLP_S4#, bit2 = SLP_S3#, bit3 = RSV
++ * Note: this is S3/S5 swapped vs Intel eSPI Base Spec Table 9 wire order;
++ * measured PE15=1 coincides with s02 bit2=1, not bit0.
++ */
++#define ESPI_SYS_EVT_2_SLP_S3_N BIT(2)
+ #define ESPI_SYS_EVT_2_SLP_S4_N BIT(1)
+-#define ESPI_SYS_EVT_2_SLP_S3_N BIT(0)
++#define ESPI_SYS_EVT_2_SLP_S5_N BIT(0)
+ 
+ #define ESPI_SYS_EVT_3_OOB_RST_WARN BIT(2)
+ #define ESPI_SYS_EVT_3_PLTRST_N BIT(1)
+@@ -144,7 +150,8 @@ struct host_bmc_msg_exch {
+ };
+ 
+ #define GET_PEER_DEV(node_id,local_node_id,...)     \
+-    (DT_SAME_NODE(node_id,local_node_id)?0:(uint32_t)DEVICE_DT_GET(node_id))
++    ((DT_SAME_NODE(node_id,local_node_id) || !DT_NODE_HAS_PROP(node_id, kcs_env_addr)) \
++		? 0 : (uint32_t)DEVICE_DT_GET(node_id))
+ #define HOST_BMC_MSG_EXCH_INIT(idx,rx_cb,peer_rx_cb) {\
+     .peer = (const struct device *)(DT_FOREACH_CHILD_STATUS_OKAY_SEP_VARGS(DT_INST_PARENT(idx),GET_PEER_DEV,(+),DT_DRV_INST(idx))),  \
+     .peer_rx_callback = peer_rx_cb, \
+@@ -169,9 +176,14 @@ struct espi_lpc_ls_data {
+     const struct espi_lpc_ls_config *cfg;
+     sys_slist_t peri_io;
+     sys_slist_t peri_mem;
++    sys_slist_t callbacks;
++    /* Set after TARGET_BOOT_DONE sent for current VW CH_EN session */
++    bool vw_boot_done_sent;
++    /* Last latched SUS_WARN level: -1 unknown, 0/1 for edge detect on idx 0x41 */
++    int8_t vw_sus_warn_last;
+     union{
+         struct espi_data{
+-            struct k_sem vw_tx_sem;
++            struct k_spinlock vw_tx_lock;
+             struct gpio_callback cs_cb;
+         }espi;
+         struct {
+diff --git a/soc/linkedsemi/ls101x/Kconfig.defconfig b/soc/linkedsemi/ls101x/Kconfig.defconfig
+index 0b2644663a3..46e5f2aeb29 100644
+--- a/soc/linkedsemi/ls101x/Kconfig.defconfig
++++ b/soc/linkedsemi/ls101x/Kconfig.defconfig
+@@ -34,12 +34,26 @@ config PMP_SLOTS
+ config PMP_GRANULARITY
+ 	default 128
+ 
++config SYSMAP_GRANULARITY
++	int
++	default 4096
++
++config NOCACHE_GRANULARITY
++	int
++	default SYSMAP_GRANULARITY
++
+ config PMP_NO_NA4
+ 	default y
+ 
+ config RISCV_SOC_HAS_ISR_STACKING
+ 	default y
+ 
++config ICACHE_LINE_SIZE
++	default 32
++
++config DCACHE_LINE_SIZE
++	default 32
++
+ if SMP
+ 
+ config TICKET_SPINLOCKS
+diff --git a/soc/linkedsemi/ls101x/smp/lsqsh_smp.h b/soc/linkedsemi/ls101x/smp/lsqsh_smp.h
+new file mode 100644
+index 00000000000..11a63cd00b0
+--- /dev/null
++++ b/soc/linkedsemi/ls101x/smp/lsqsh_smp.h
+@@ -0,0 +1,37 @@
++#ifndef _LSQSH_SMP_H_
++#define _LSQSH_SMP_H_
++
++/* Minimal stub for LS101x (single-core). Full SMP lives under lsqsh. */
++
++#include <zephyr/sys/atomic.h>
++#include <zephyr/spinlock.h>
++
++static inline uint32_t get_cur_cpu_id(void)
++{
++	return 0;
++}
++
++static inline void lsqsh_ipi_intr_set(uint32_t cpu_id)
++{
++	ARG_UNUSED(cpu_id);
++}
++
++static inline void lsqsh_ipi_intr_clr(uint32_t cpu_id)
++{
++	ARG_UNUSED(cpu_id);
++}
++
++static inline void poll_wait_xip_unlock(bool is_write)
++{
++	ARG_UNUSED(is_write);
++}
++
++static inline void flash_critical_exit_sync(void)
++{
++}
++
++static inline void flash_critical_enter_sync(void)
++{
++}
++
++#endif /* _LSQSH_SMP_H_ */
+diff --git a/soc/linkedsemi/ls101x/soc.h b/soc/linkedsemi/ls101x/soc.h
+index 646300a9bed..53811fb4636 100644
+--- a/soc/linkedsemi/ls101x/soc.h
++++ b/soc/linkedsemi/ls101x/soc.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (c) 2020 Linkedsemi
++ * Copyright (c) 2026 LinkedSemi
+  *
+  * SPDX-License-Identifier: Apache-2.0
+  */
+@@ -10,4 +11,28 @@
+ #include "soc_common.h"
+ #define IRQ_NESTED_MAX 10
+ 
++#define IRQ_TYPE_NONE         0
++#define IRQ_TYPE_EDGE_RISING  1
++#define IRQ_TYPE_EDGE_FALLING 2
++#define IRQ_TYPE_EDGE_BOTH    (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_EDGE_RISING)
++#define IRQ_TYPE_LEVEL_HIGH   4
++#define IRQ_TYPE_LEVEL_LOW    8
++
++/* CLIC INTATTR.TRIG encodings used by common/e906/irq_driver.c */
++#ifndef CLIC_ATTR_TRIG_POSITIVE_LEVEL
++#define CLIC_ATTR_TRIG_POSITIVE_LEVEL 0
++#endif
++#ifndef CLIC_ATTR_TRIG_POSITIVE_EDGE
++#define CLIC_ATTR_TRIG_POSITIVE_EDGE  1
++#endif
++#ifndef CLIC_ATTR_TRIG_NEGATIVE_EDGE
++#define CLIC_ATTR_TRIG_NEGATIVE_EDGE  3
++#endif
++
++#include <zephyr/logging/log.h>
++#define DEV_ERR(dev, fmt, ...) LOG_ERR("%s: " fmt, (dev)->name, ##__VA_ARGS__)
++#define DEV_WRN(dev, fmt, ...) LOG_WRN("%s: " fmt, (dev)->name, ##__VA_ARGS__)
++#define DEV_INF(dev, fmt, ...) LOG_INF("%s: " fmt, (dev)->name, ##__VA_ARGS__)
++#define DEV_DBG(dev, fmt, ...) LOG_DBG("%s: " fmt, (dev)->name, ##__VA_ARGS__)
++
+ #endif /* _SOC_H_ */

@@ -1,0 +1,5 @@
+# Copyright (c) 2026 LinkedSemi
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_LS101X_EHL_TCP_3L
+	select SOC_LS1010

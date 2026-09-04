@@ -1,0 +1,17 @@
+# Kconfig - board options for LinkedSemi EC
+# SPDX-License-Identifier: Apache-2.0
+
+menu "Optional board features"
+
+config BOARD_ID_IO_EXPANDER
+	bool "IO Expander used for generating board ID"
+	default n
+	help
+	  Indicates if board ID is generated making use of an IO Expander.
+
+config ATX_SUPPORT
+	bool "ATX power supply detection"
+	help
+	  Indicate if EC handles detection of ATX power supply.
+
+endmenu

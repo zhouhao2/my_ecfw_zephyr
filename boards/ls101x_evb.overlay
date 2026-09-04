@@ -1,0 +1,139 @@
+/*
+ * App overlay for ls101x_evb — LinkedSemi EC PoC (pin quarantine)
+ *
+ * Validation pin policy:
+ *   KEEP:  eSPI pads (PD9 alert + PD10..PD15), console UART3 (PH6/PH7),
+ *          SLP_S3# PE15 / PLTRST# PD03 as GPIO inputs
+ *   DROP:  all other board DTS peripheral mux (PWM/SPI/I2C/USB/CAP/PECI/…)
+ */
+
+#include <zephyr/dt-bindings/pinctrl/ls101x-pinctrl.h>
+
+&pinctrl {
+	uart3_tx_ph07: uart3_tx_ph07 {
+		pinmux = <LS_PINMUX_SET('H', 7, UART3_TXD)>;
+		output-enable;
+		output-high;
+	};
+
+	uart3_rx_ph06: uart3_rx_ph06 {
+		pinmux = <LS_PINMUX_SET('H', 6, UART3_RXD)>;
+		bias-pull-up;
+		input-enable;
+	};
+};
+
+&uart3 {
+	pinctrl-0 = <&uart3_tx_ph07 &uart3_rx_ph06>;
+	pinctrl-names = "default";
+	current-speed = <921600>;
+};
+
+/* ---- Disable every board peripheral that claims pads via pinctrl ---- */
+&uart1 {
+	status = "disabled";
+};
+
+&uart2 {
+	status = "disabled";
+};
+
+&dwuart1 {
+	status = "disabled";
+};
+
+&dwuart2 {
+	status = "disabled";
+};
+
+&usb {
+	status = "disabled";
+};
+
+&pwm {
+	status = "disabled";
+};
+
+&cap {
+	status = "disabled";
+};
+
+&spi1 {
+	status = "disabled";
+};
+
+&spi2 {
+	status = "disabled";
+};
+
+&spi3 {
+	status = "disabled";
+};
+
+&i2c1 {
+	status = "disabled";
+};
+
+&i2c2 {
+	status = "disabled";
+};
+
+/* Child EEPROMs stay "okay" when parent I2C is disabled → build break in eeprom_target */
+&eeprom1 {
+	status = "disabled";
+};
+
+&eeprom2 {
+	status = "disabled";
+};
+
+&peci0 {
+	status = "disabled";
+};
+
+&adc1 {
+	status = "disabled";
+};
+
+&adc2 {
+	status = "disabled";
+};
+
+&dac12 {
+	status = "disabled";
+};
+
+&espi {
+	/* Software VW shadow (writable SRAM); required by ls-espi binding */
+	sysevent-base = <0x1001ffe0>;
+	/*
+	 * cs-gpios intentionally omitted: soft-recover path + init-priority
+	 * (GPIO POST_KERNEL vs eSPI PRE_KERNEL_2).
+	 */
+	status = "okay";
+
+	/*
+	 * ACPI EC 0x60/0x64: Host-side IO decode. Peer lookup only sums
+	 * siblings that have kcs-env-addr (SIO/other peri children are skipped).
+	 * Shared SRAM env is the same address as e8042 kcs-env-addr.
+	 */
+	host_kcs: host-kcs {
+		compatible = "linkedsemi,ls-host-kcs";
+		port = <0x60 0x64>;
+		kcs-env-addr = <0x1001ffc0>;
+		espi_lpc = <&espi>;
+		status = "okay";
+	};
+
+	/* Super I/O config index/data 0x2E/0x2F (BIOS probes this before KBC). */
+	sio0: sio {
+		compatible = "linkedsemi,ls-sio";
+		port = <0x2e>;
+		status = "okay";
+	};
+};
+
+&e8042 {
+	kcs-env-addr = <0x1001ffc0>;
+	/delete-property/ up-irq;
+};

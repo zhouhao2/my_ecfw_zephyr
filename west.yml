@@ -1,0 +1,23 @@
+# West manifest for LinkedSemi EC firmware (Leo / LS101x)
+# SPDX-License-Identifier: Apache-2.0
+
+manifest:
+  remotes:
+    - name: linkedsemi
+      url-base: https://github.com/linkedsemi
+
+  defaults:
+    remote: linkedsemi
+
+  projects:
+    - name: zephyr
+      revision: linkedsemi
+      path: zephyr
+      west-commands: scripts/west-commands.yml
+
+    - name: ls_sdk
+      revision: main
+      path: ls_sdk
+
+  self:
+    path: my_ecfw_zephyr

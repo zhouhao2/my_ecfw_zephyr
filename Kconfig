@@ -1,0 +1,60 @@
+# Kconfig - LinkedSemi EC FW (Leo / LS101x)
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "LinkedSemi Embedded Controller firmware"
+
+rsource "app/peripheral_management/Kconfig"
+rsource "app/debug/Kconfig"
+rsource "app/power_sequencing/Kconfig"
+rsource "app/smchost/Kconfig"
+rsource "app/kbchost/Kconfig"
+rsource "app/thermal_management/Kconfig"
+
+menu "EC optional features"
+
+rsource "app/power_management/Kconfig"
+rsource "app/soc_debug_awareness/Kconfig"
+rsource "boards/Kconfig"
+
+config LS_ECFW_POC_SIM_PWRSEQ
+	bool "Simulate power sequencing without full RVP GPIOs"
+	default y
+	help
+	  Log-step power sequence when board power GPIOs are stubs on EVB.
+
+config LS_ECFW_RELAXED_DEVICE_CHECK
+	bool "Do not fail boot if some DT devices are not ready"
+	default y
+	help
+	  EVB may enable peripherals not needed by EC PoC.
+
+endmenu
+
+menu "EC logging control"
+
+config EC_DEBUG_LOG
+	bool "Embedded controller logs"
+	depends on LOG
+	default y
+
+config EC_LOG_LEVEL
+	int "Embedded controller application log level"
+	depends on LOG
+	default 3 if EC_DEBUG_LOG
+	default 0
+
+config BOARD_LOG_LEVEL
+	int "Board initialization log level"
+	depends on LOG
+	default 3 if EC_DEBUG_LOG
+	default 0
+
+config EC_DELAYED_BOOT
+	int "Delayed boot in seconds"
+	default 0
+
+endmenu
+
+rsource "drivers/Kconfig"
+
+source "Kconfig.zephyr"

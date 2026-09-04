@@ -1,0 +1,43 @@
+diff --git a/tools/leo/fw_desc_gen.py b/tools/leo/fw_desc_gen.py
+index ac7488d0..fa7f414b 100644
+--- a/tools/leo/fw_desc_gen.py
++++ b/tools/leo/fw_desc_gen.py
+@@ -19,7 +19,7 @@ fw_bin = open(sys.argv[1],'rb')
+ name = os.path.basename(sys.argv[1]).split('.')[0]
+ output_dir = os.path.dirname(sys.argv[1])
+ fw_data = bytearray(fw_bin.read())
+-app_version = 0x1
++app_version = 0xff
+ reserved = 0x0
+ app_magic = b'LSEC_APP'
+ sign_and_image_data = fw_data[APP_SIGN_OFFSET:]
+diff --git a/zephyr/CMakeLists.txt b/zephyr/CMakeLists.txt
+index 0c1c984a..5f1251d9 100644
+--- a/zephyr/CMakeLists.txt
++++ b/zephyr/CMakeLists.txt
+@@ -81,7 +81,7 @@ if(CONFIG_SOC_LS1010)
+     # ../module/crc
+     ../module/debug
+     ../module/debug/RTT
+-    # ../module/static_buffer
++    ../module/static_buffer
+     # ../module/tinyfs
+     # ../module/tinycrypt/lib/include
+   )
+@@ -130,6 +130,7 @@ if(CONFIG_SOC_LS1010)
+     ../hal_driver/src/ls_hal_qspiv2.c
+     ../hal_driver/src/ls_hal_flash_qspiv2.c
+     ../hal_driver/src/ls_hal_flash.c
++    ../hal_driver/src/flash_inst1.c
+     ../hal_driver/src/ls_hal_cache.c
+     ../hal_driver/src/ls_hal_comp.c
+     ../hal_driver/src/ls_hal_uart.c
+@@ -164,7 +165,7 @@ if(CONFIG_SOC_LS1010)
+     ../hal_driver/src/ls_hal_iwdgv2.c
+     ../hal_driver/src/ls_hal_ps2h.c
+     ../soc/rv32/systick.c
+-    # ../soc/rv32/int_call_asm.S
++    ../soc/rv32/int_call_asm.S
+     ../soc/rv32/leo/cpu.c
+     ../soc/rv32/leo/sleep_asm.S
+     ../soc/rv32/leo/exception_entry.S

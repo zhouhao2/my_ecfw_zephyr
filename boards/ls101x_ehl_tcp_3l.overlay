@@ -1,0 +1,8 @@
+/*
+ * App overlay for ls101x_ehl_tcp_3l.
+ *
+ * Pin policy, UART3 PH06/PH07 @ 921600, eSPI host-kcs (0x60/0x64),
+ * Super I/O (0x2E/0x2F) and SIO COM1–COM4 already live
+ * in the board DTS. Keep this file for product-only extras; do not
+ * re-enable PWM8 on PE15.
+ */

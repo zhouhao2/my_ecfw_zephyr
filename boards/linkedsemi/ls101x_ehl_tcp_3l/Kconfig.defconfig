@@ -1,0 +1,15 @@
+# Copyright (c) 2026 LinkedSemi
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_LS101X_EHL_TCP_3L
+
+config BOARD
+	default "ls101x_ehl_tcp_3l"
+
+config FLASH_LOAD_OFFSET
+	default 0x0
+
+config HEAP_MEM_POOL_SIZE
+	default 4096
+
+endif

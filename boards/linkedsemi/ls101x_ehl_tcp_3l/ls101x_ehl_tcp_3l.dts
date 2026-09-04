@@ -1,0 +1,248 @@
+/*
+ * Copyright (c) 2026 LinkedSemi
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Product carrier: host motherboard EHL_TCP_3L (Leo / LS1010 EC).
+ *
+ * - Timing is done by motherboard hardware; EC does not drive RSMRST.
+ * - Sense-only: PE15 ← SLP_S3#, PD03 ← PLTRST# (GPIO inputs; not PWM8).
+ * - Host works as Super I/O; BIOS does not decode ACPI EC 0x62/0x66.
+ * - Console UART3: TX PH07 / RX PH06 @ 921600.
+ */
+
+/dts-v1/;
+#include <riscv/linkedsemi/ls101x.dtsi>
+#include "ls101x_ehl_tcp_3l-pinctrl.dtsi"
+#include <zephyr/dt-bindings/pinctrl/ls101x-pinctrl.h>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+
+#define BTN_GPIO_FLAGS (GPIO_ACTIVE_HIGH | GPIO_PULL_UP)
+
+/ {
+	model = "linkedsemi LS101X EHL_TCP_3L";
+	compatible = "linkedsemi,ls101x_ehl_tcp_3l";
+
+	chosen {
+		zephyr,flash = &flash0;
+		zephyr,sram = &sram0;
+		zephyr,shell-uart = &uart3;
+		zephyr,console = &uart3;
+	};
+
+	aliases {
+		led0 = &led0;
+		sw0 = &btn0;
+		rtc0 = &rtc0;
+		watchdog0 = &iwdg;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpioa 0 GPIO_ACTIVE_HIGH>;
+			label = "Red LED";
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys";
+		btn0: btn_0 {
+			gpios = <&gpiob 7 BTN_GPIO_FLAGS>;
+			label = "Push button 1";
+		};
+	};
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "info-sbl";
+			reg = <0x00000000 0x00001800>;
+		};
+
+		app_partition: partition@1800 {
+			label = "app";
+			reg = <0x00001800 0x0007c800>;
+		};
+
+		storage_partition: partition@7d000 {
+			label = "storage";
+			reg = <0x0007d000 0x00003000>;
+		};
+	};
+};
+
+&cpu0 {
+	clock-frequency = <144000000>;
+	cpu-power-states = <&idle &lp0>;
+};
+
+&rtc0 {
+	status = "okay";
+};
+
+&uart3 {
+	status = "okay";
+	pinctrl-0 = <&uart3_tx_ph07 &uart3_rx_ph06>;
+	pinctrl-names = "default";
+	current-speed = <921600>;
+};
+
+/* SoC dtsi leaves these okay; disable so they do not claim pads (esp. PE15/PWM8). */
+&spi1 {
+	status = "disabled";
+};
+
+&cap {
+	status = "disabled";
+};
+
+&pwm {
+	status = "disabled";
+};
+
+&iwdg {
+	status = "okay";
+};
+
+&espi {
+	/* Software VW shadow (writable SRAM); required by ls-espi binding */
+	sysevent-base = <0x1001ffe0>;
+	/*
+	 * cs-gpios omitted: soft-recover path + init-priority
+	 * (GPIO POST_KERNEL vs eSPI PRE_KERNEL_2).
+	 */
+	status = "okay";
+
+	e8042: e8042 {
+		compatible = "linkedsemi,ls-kcs";
+		port = <0x60 0x64>;
+		kcs-env-addr = <0x1001ffc0>;
+		status = "okay";
+	};
+
+	/*
+	 * Host KBC 0x60/0x64 decode. Peer lookup only sums siblings that
+	 * have kcs-env-addr (SIO/other peri children are skipped).
+	 */
+	host_kcs: host-kcs {
+		compatible = "linkedsemi,ls-host-kcs";
+		port = <0x60 0x64>;
+		kcs-env-addr = <0x1001ffc0>;
+		espi_lpc = <&espi>;
+		status = "okay";
+	};
+
+	/* Super I/O config index/data 0x2E/0x2F (BIOS probes this before KBC). */
+	sio0: sio {
+		compatible = "linkedsemi,ls-sio";
+		port = <0x2e>;
+		chip-id = <0x8786>;
+		status = "okay";
+
+		/*
+		 * Host COM ports via SIO LDN. Keep SoC UART nodes disabled
+		 * (not Zephyr consoles). Do not add kcs-env-addr here.
+		 */
+		sio_uart1: sio-uart1 {
+			compatible = "linkedsemi,ls-sio-uart";
+			ldn = <0x01>;
+			uart = <&dwuart1>;
+			default-io = <0x3f8>;
+			default-irq = <4>;
+			pinctrl-0 = <&dwuart1_tx_pc11 &dwuart1_rx_pc12
+				     &dwuart1_rts_pc09 &dwuart1_cts_pc07>;
+			pinctrl-names = "default";
+			dtr-gpios = <&gpioc 8 GPIO_ACTIVE_LOW>;
+			dsr-gpios = <&gpioc 10 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			ri-gpios = <&gpioc 6 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			dcd-gpios = <&gpioc 5 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			status = "okay";
+		};
+
+		sio_uart2: sio-uart2 {
+			compatible = "linkedsemi,ls-sio-uart";
+			ldn = <0x02>;
+			uart = <&dwuart2>;
+			default-io = <0x2f8>;
+			default-irq = <3>;
+			pinctrl-0 = <&dwuart2_tx_pe11 &dwuart2_rx_pe12
+				     &dwuart2_rts_pe09 &dwuart2_cts_pe06>;
+			pinctrl-names = "default";
+			dtr-gpios = <&gpioe 8 GPIO_ACTIVE_LOW>;
+			dsr-gpios = <&gpioe 10 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			ri-gpios = <&gpioe 7 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			dcd-gpios = <&gpioe 4 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			status = "okay";
+		};
+
+		sio_uart3: sio-uart3 {
+			compatible = "linkedsemi,ls-sio-uart";
+			ldn = <0x08>;
+			uart = <&uart1>;
+			default-io = <0x3e8>;
+			default-irq = <0x0b>;
+			pinctrl-0 = <&uart1_tx_pf08 &uart1_rx_pf09
+				     &uart1_rts_pf06 &uart1_cts_pf04>;
+			pinctrl-names = "default";
+			dtr-gpios = <&gpiof 5 GPIO_ACTIVE_LOW>;
+			dsr-gpios = <&gpiof 7 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			ri-gpios = <&gpiof 3 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			dcd-gpios = <&gpiof 2 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			status = "okay";
+		};
+
+		sio_uart4: sio-uart4 {
+			compatible = "linkedsemi,ls-sio-uart";
+			ldn = <0x09>;
+			uart = <&uart2>;
+			default-io = <0x2e8>;
+			default-irq = <0x0b>;
+			pinctrl-0 = <&uart2_tx_pg06 &uart2_rx_ph00
+				     &uart2_rts_pg04 &uart2_cts_pg02>;
+			pinctrl-names = "default";
+			dtr-gpios = <&gpiog 3 GPIO_ACTIVE_LOW>;
+			dsr-gpios = <&gpiog 5 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			ri-gpios = <&gpiog 1 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			dcd-gpios = <&gpiog 0 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			status = "okay";
+		};
+	};
+};
+
+&gpioa {
+	status = "okay";
+};
+
+&gpiob {
+	status = "okay";
+};
+
+&gpioc {
+	status = "okay";
+};
+
+&gpiod {
+	status = "okay";
+};
+
+&gpioe {
+	status = "okay";
+};
+
+&gpiof {
+	status = "okay";
+};
+
+&gpiog {
+	status = "okay";
+};
+
+&gpioh {
+	status = "okay";
+};

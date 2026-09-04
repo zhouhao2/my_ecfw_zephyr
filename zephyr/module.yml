@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Register this application as a Zephyr module so west/CMake can find
+# the out-of-tree board ls101x_ehl_tcp_3l under boards/.
+# Do not set build.cmake / build.kconfig — this is the app, not a library.
+
+name: my_ecfw_zephyr
+build:
+  settings:
+    board_root: .

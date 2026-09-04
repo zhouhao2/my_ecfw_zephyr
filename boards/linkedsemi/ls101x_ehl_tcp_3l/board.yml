@@ -1,0 +1,5 @@
+board:
+  name: ls101x_ehl_tcp_3l
+  vendor: linkedsemi
+  socs:
+  - name: ls1010
